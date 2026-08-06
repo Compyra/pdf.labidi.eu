@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="color-scheme" content="dark light">
+
+    <!--
+      Everything runs on this device. Vendored libraries (pdf-lib, pdf.js,
+      tesseract.js) are served from this origin; no CDN, no upload endpoint.
+      connect-src 'self' exists only so the service worker and the OCR worker
+      can fetch same-origin assets. No document byte can ever leave the page.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none';
+        script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline';
+        img-src 'self' data: blob:; font-src 'self'; connect-src 'self' blob:;
+        manifest-src 'self'; worker-src 'self' blob:; base-uri 'none'; form-action 'none';
+        frame-src 'none'; object-src 'none'">
+    <meta name="referrer" content="no-referrer">
+
+    <title data-i18n="app_title">PDF Studio · Local PDF toolbox</title>
+    <meta name="description" data-i18n-content="app_desc"
+        content="Merge, split, compress, convert, OCR, sign, watermark and protect PDFs — 40+ tools running fully in your browser. No uploads, no tracking, works offline.">
+    <meta name="theme-color" id="meta-theme" content="#140a08">
+
+    <link rel="canonical" href="https://pdf.labidi.eu/">
+    <link rel="alternate" hreflang="en" href="https://pdf.labidi.eu/?lang=en">
+    <link rel="alternate" hreflang="nl" href="https://pdf.labidi.eu/?lang=nl">
+    <link rel="alternate" hreflang="fr" href="https://pdf.labidi.eu/?lang=fr">
+    <link rel="alternate" hreflang="x-default" href="https://pdf.labidi.eu/">
+
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://pdf.labidi.eu/">
+    <meta property="og:title" data-i18n-content="app_title" content="PDF Studio · Local PDF toolbox">
+    <meta property="og:description" data-i18n-content="app_desc"
+        content="Merge, split, compress, convert, OCR, sign, watermark and protect PDFs — 40+ tools running fully in your browser. No uploads, no tracking, works offline.">
+    <meta property="og:image" content="https://pdf.labidi.eu/icon.svg">
+    <meta name="twitter:card" content="summary">
+
+    <!--
+      Own assets carry ?v= on purpose (Cloudflare + GitHub Pages cache CSS/JS
+      for hours; a versioned URL swaps the whole set atomically).
+      Vendored library files are content-pinned and never change, so they are
+      served unversioned and cached forever.
+
+      DEPLOY: bump this number here AND `V` in sw.js, together.
+    -->
+    <link rel="stylesheet" href="style.css?v=1">
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="icon" href="icon.svg">
+    <link rel="apple-touch-icon" href="icon.svg">
+
+    <script src="vendor/pdf-lib.min.js" defer></script>
+    <script src="vendor/pdfjs/pdf.min.js" defer></script>
+    <script src="vendor/tesseract/tesseract.min.js" defer></script>
+    <script src="i18n.js?v=1" defer></script>
+    <script src="app.js?v=1" defer></script>
+    <script src="tools.js?v=1" defer></script>
+</head>
+
+<body>
+    <div class="app-bg" aria-hidden="true">
+        <div class="blob b1"></div>
+        <div class="blob b2"></div>
+        <div class="grid-overlay"></div>
+    </div>
+
+    <header class="topbar">
+        <button type="button" class="icon-btn nav-toggle" id="nav-toggle" aria-controls="side"
+            aria-expanded="false" data-i18n-aria="nav_tools" data-i18n-title="nav_tools"
+            title="Tools" aria-label="Tools"><span aria-hidden="true">☰</span></button>
+
+        <a class="brand" href="#/" id="brand-home">
+            <span class="brand-mark" aria-hidden="true">⎘</span>
+            <span class="brand-text">
+                <strong>PDF&nbsp;Studio</strong>
+                <small data-i18n="brand_sub">local · private · offline</small>
+            </span>
+        </a>
+
+        <div class="ws-chip" id="ws-chip" hidden>
+            <button type="button" class="ws-name" id="ws-open-preview" data-i18n-title="ws_preview" title="Preview">
+                <span class="ws-file" id="ws-name">document.pdf</span>
+                <span class="ws-meta" id="ws-meta">– p · –</span>
+            </button>
+            <span class="ws-actions">
+                <button type="button" class="icon-btn" id="ws-undo" data-i18n-title="ws_undo" title="Undo"
+                    data-i18n-aria="ws_undo" aria-label="Undo" disabled><span aria-hidden="true">↶</span></button>
+                <button type="button" class="icon-btn" id="ws-redo" data-i18n-title="ws_redo" title="Redo"
+                    data-i18n-aria="ws_redo" aria-label="Redo" disabled><span aria-hidden="true">↷</span></button>
+                <button type="button" class="icon-btn" id="ws-download" data-i18n-title="ws_download" title="Download"
+                    data-i18n-aria="ws_download" aria-label="Download"><span aria-hidden="true">⭳</span></button>
+                <button type="button" class="icon-btn" id="ws-close" data-i18n-title="ws_close" title="Close file"
+                    data-i18n-aria="ws_close" aria-label="Close file"><span aria-hidden="true">✕</span></button>
+            </span>
+        </div>
+
+        <div class="top-actions">
+            <div class="menu appswitch">
+                <button type="button" id="apps-btn" class="icon-btn" aria-haspopup="true" aria-expanded="false"
+                    data-i18n-title="as_switch" data-i18n-aria="as_switch" title="Switch project"
+                    aria-label="Switch project"><span aria-hidden="true">▦</span></button>
+                <div class="menu-list appswitch__list" id="apps-menu" role="menu" hidden>
+                    <a class="app-item" role="menuitem" href="https://note.labidi.eu/">
+                        <span class="app-item__mark" aria-hidden="true">{ }</span>
+                        <span class="app-item__text"><strong>Note</strong><small data-i18n="as_note">Code editor</small></span>
+                    </a>
+                    <a class="app-item" role="menuitem" href="https://md.labidi.eu/">
+                        <span class="app-item__mark" aria-hidden="true">✍︎</span>
+                        <span class="app-item__text"><strong>Markdown Studio</strong><small data-i18n="as_md">Markdown editor</small></span>
+                    </a>
+                    <a class="app-item" role="menuitem" href="https://todo.labidi.eu/">
+                        <span class="app-item__mark" aria-hidden="true">☑</span>
+                        <span class="app-item__text"><strong>Daily Board</strong><small data-i18n="as_todo">Notes &amp; tasks</small></span>
+                    </a>
+                    <a class="app-item app-item--all" role="menuitem" href="https://labidi.eu/" target="_blank" rel="noopener">
+                        <span class="app-item__mark" aria-hidden="true">▦</span>
+                        <span class="app-item__text"><strong data-i18n="as_all">All projects</strong><small>labidi.eu</small></span>
+                    </a>
+                </div>
+            </div>
+
+            <div class="menu">
+                <button type="button" id="lang-btn" class="icon-btn" aria-haspopup="true" aria-expanded="false"
+                    data-i18n-title="lang_label" data-i18n-aria="lang_label" title="Language" aria-label="Language">
+                    <span aria-hidden="true" id="lang-current">EN</span>
+                </button>
+                <div class="menu-list" id="lang-menu" role="menu" hidden>
+                    <button type="button" role="menuitem" data-lang="en">English</button>
+                    <button type="button" role="menuitem" data-lang="fr">Français</button>
+                    <button type="button" role="menuitem" data-lang="nl">Nederlands</button>
+                </div>
+            </div>
+
+            <button type="button" id="theme-btn" class="icon-btn" data-i18n-title="theme_toggle"
+                data-i18n-aria="theme_toggle" title="Theme" aria-label="Theme"><span aria-hidden="true">◐</span></button>
+        </div>
+    </header>
+
+    <div class="layout">
+        <aside class="side" id="side" aria-label="Tools">
+            <div class="side-search">
+                <input type="search" id="tool-search" data-i18n-placeholder="search_tools"
+                    placeholder="Search tools…" autocomplete="off">
+            </div>
+            <nav class="side-nav" id="side-nav"></nav>
+        </aside>
+
+        <main class="main" id="main" tabindex="-1">
+            <div id="view"></div>
+        </main>
+
+        <aside class="preview" id="preview" aria-label="Preview" hidden>
+            <div class="preview-bar">
+                <strong data-i18n="pv_title">Preview</strong>
+                <span class="preview-tools">
+                    <button type="button" class="icon-btn" id="pv-zoom-out" title="−" aria-label="Zoom out"><span aria-hidden="true">−</span></button>
+                    <span id="pv-zoom-label">100%</span>
+                    <button type="button" class="icon-btn" id="pv-zoom-in" title="+" aria-label="Zoom in"><span aria-hidden="true">+</span></button>
+                    <button type="button" class="icon-btn" id="pv-close" data-i18n-title="close" title="Close"
+                        data-i18n-aria="close" aria-label="Close"><span aria-hidden="true">✕</span></button>
+                </span>
+            </div>
+            <div class="preview-pages" id="pv-pages"></div>
+        </aside>
+    </div>
+
+    <div class="dropzone" id="dropzone" hidden>
+        <div class="dropzone-inner">
+            <span aria-hidden="true">⤓</span>
+            <p data-i18n="drop_hint">Drop your PDF anywhere</p>
+        </div>
+    </div>
+
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+
+    <dialog id="modal" class="modal">
+        <div class="modal-head">
+            <strong id="modal-title"></strong>
+            <button type="button" class="icon-btn" id="modal-close" data-i18n-title="close" title="Close"
+                data-i18n-aria="close" aria-label="Close"><span aria-hidden="true">✕</span></button>
+        </div>
+        <div class="modal-body" id="modal-body"></div>
+    </dialog>
+
+    <input type="file" id="file-global" accept="application/pdf,.pdf" hidden>
+
+    <footer class="foot">
+        <p data-i18n="foot_privacy">Every operation runs in your browser. Files never leave your device.</p>
+        <p class="foot-links">
+            <a href="https://labidi.eu/" target="_blank" rel="noopener">labidi.eu</a>
+            <span aria-hidden="true">·</span>
+            <a href="https://rami.party/" target="_blank" rel="noopener">rami.party</a>
+        </p>
+    </footer>
+</body>
+
+</html>
