@@ -364,12 +364,14 @@
 
     /* hxxp://example[.]com — safe to paste into a ticket or a chat */
     function defangUrl(url) {
-        return String(url)
-            .replace(/^http/i, 'hxxp')
-            .replace(/^ftp/i, 'fxp')
-            .replace(/:\/\//, '[://]')
-            .replace(/\./g, '[.]')
-            .replace(/@/g, '[@]');
+        const raw = String(url).trim();
+        const scheme = raw.match(/^([a-z][a-z0-9+.-]*):/i);
+        let out = raw;
+        if (scheme && /^http/i.test(scheme[1])) out = out.replace(/^http/i, 'hxxp');
+        else if (scheme && /^ftp/i.test(scheme[1])) out = out.replace(/^ftp/i, 'fxp');
+        if (out.includes('://')) out = out.replace(/:\/\//g, '[://]');
+        else if (scheme) out = out.replace(/^([a-z][a-z0-9+.-]*):/i, '$1[:]');
+        return out.replace(/\./g, '[.]').replace(/@/g, '[@]');
     }
 
     /* Grades a URL. An ordinary https link is 'low': flagging every address as
