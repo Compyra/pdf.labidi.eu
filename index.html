@@ -85,6 +85,8 @@
                 <span class="ws-meta" id="ws-meta">– p · –</span>
             </button>
             <span class="ws-actions">
+                <button type="button" class="icon-btn" id="ws-view" data-i18n-title="ws_view" title="View"
+                    data-i18n-aria="ws_view" aria-label="View" aria-pressed="false"><span aria-hidden="true">👁</span></button>
                 <button type="button" class="icon-btn" id="ws-undo" data-i18n-title="ws_undo" title="Undo"
                     data-i18n-aria="ws_undo" aria-label="Undo" disabled><span aria-hidden="true">↶</span></button>
                 <button type="button" class="icon-btn" id="ws-redo" data-i18n-title="ws_redo" title="Redo"
@@ -156,6 +158,7 @@
             <div class="preview-bar">
                 <strong data-i18n="pv_title">Preview</strong>
                 <span class="preview-tools">
+                    <span id="pv-count" class="pv-count"></span>
                     <button type="button" class="icon-btn" id="pv-zoom-out" title="−" aria-label="Zoom out"><span aria-hidden="true">−</span></button>
                     <span id="pv-zoom-label">100%</span>
                     <button type="button" class="icon-btn" id="pv-zoom-in" title="+" aria-label="Zoom in"><span aria-hidden="true">+</span></button>

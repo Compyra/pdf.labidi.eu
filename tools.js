@@ -4037,7 +4037,19 @@
 
                         if (cRaster.input.checked) {
                             runner.progress(0.1, t('working'));
-                            const tmp = await A.pdfjsDocFor(bytes);
+                            /* This is the option the tool itself recommends for
+                               certainty, so it must fail loudly rather than spin
+                               forever on a file the renderer cannot open. */
+                            let tmp;
+                            try {
+                                tmp = await Promise.race([
+                                    A.pdfjsDocFor(bytes),
+                                    new Promise((_, rj) => setTimeout(() => rj(new Error('render timeout')), 60000)),
+                                ]);
+                            } catch (e) {
+                                runner.error(new Error(t('df_raster_failed')));
+                                return;
+                            }
                             const src = await loadLib(bytes);
                             const out = await PDFLib.PDFDocument.create();
                             // a damaged file can leave the two parsers disagreeing
@@ -4052,6 +4064,7 @@
                                 runner.progress(0.1 + 0.85 * ((i + 1) / nPages));
                             }
                             tmp.destroy();
+                            if (!out.getPageCount()) { runner.error(new Error(t('df_raster_failed'))); return; }
                             bytes = await out.save();
                             bump('raster', 1);
                         }
@@ -4070,9 +4083,11 @@
                         await runner.applied(bytes, { downloadName: A.baseName(A.state.name) + '-defanged.pdf' });
 
                         /* change log — the evidence trail */
+                        const leftovers = check.findings.filter((f) => f.sev !== 'low');
+                        const headline = leftovers.length ? 'df_done_partial' : (log.length ? 'df_done' : 'df_done_none');
                         const card2 = runner.host.querySelector('.card.result');
                         if (card2) {
-                            card2.insertBefore(el('p', { class: 'hint', text: t(log.length ? 'df_done' : 'df_done_none') }), card2.children[1] || null);
+                            card2.insertBefore(el('p', { class: 'hint', text: t(headline) }), card2.children[1] || null);
                             const list = el('div', { class: 'finding-list', style: 'margin-top:.7rem' });
                             if (!log.length) {
                                 list.appendChild(el('p', { class: 'hint', text: t('df_nothing') }));
@@ -4095,7 +4110,6 @@
                             /* Verify instead of assert: report what the re-scan
                                of the finished file actually found. */
                             {
-                                const leftovers = check.findings.filter((f) => f.sev !== 'low');
                                 const vCard = el('div', { style: 'margin-top:.8rem' });
                                 if (!leftovers.length) {
                                     vCard.appendChild(el('p', { class: 'note', text: t('df_verified') }));

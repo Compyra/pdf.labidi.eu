@@ -1,5 +1,79 @@
 # PDF Studio — todo & changelog
 
+## Round 8 — a real viewer (2026-08-07) ✅
+
+The preview existed but was reachable only by clicking the filename, which
+nobody discovers. Made it a first-class feature.
+
+- [x] **👁 View button in the file chip**, always visible while a document is
+      open, with `aria-pressed` reflecting the panel state.
+- [x] **View button on every applied-result card**, so the changed version can
+      be checked before downloading it. The defang report gets it too.
+- [x] **Lazy page rendering.** The panel used to draw up to 120 pages up front;
+      now only what is near the viewport is drawn, on scroll. A 200-page
+      document opens immediately.
+- [x] Page count in the preview bar; each page keeps its `n / total` label.
+- [x] `openPreview` / `closePreview` / `togglePreview` exported on the app API.
+
+Bugs found while building it:
+
+- [x] **The flex column was squashing every page.** `.preview-pages` is a
+      column flex container, so the pages shrank to fit the panel height
+      instead of making the list scroll — placeholders measured 49 px instead
+      of 554 px. Fixed with `flex: none` on pages, placeholders and labels.
+- [x] **Zoom did nothing.** `max-width: 100%` clamped the canvas, so 125 %
+      still rendered at panel width. The panel now scrolls sideways when
+      zoomed, and only clamps at 100 % or less (so no stray scrollbar there).
+- [x] **The page counter pushed the close button out of the panel** on a phone.
+      Counter is hidden below 560 px; every page is numbered anyway.
+
+Verified: open/close toggle, zoom 75/100/125 %, the panel refreshing after an
+edit (removing 2 of 4 pages updated it to “2 pages”), lazy drawing filling in
+on scroll, EN/FR/NL labels, 360 px and 1400 px layouts, all 54 tools still
+rendering clean, no console errors.
+
+Correction to the round 6 notes: pdf.js *does* work in this environment — the
+earlier "renderer cannot run here" conclusion was wrong, it was a wedged shared
+worker caused by my own aborted calls. The time-boxes added then are still
+worth keeping, but they were not compensating for a broken renderer.
+
+## Round 7 — defang hardening (2026-08-07) ✅
+
+A focused pass on the tool that makes a hostile document safe, because a
+security tool that overstates what it did is worse than no tool at all.
+
+- [x] **Catalog entries were cut before the object walk**, so a file
+      specification sitting directly in the `/Names/EmbeddedFiles` tree became
+      unreachable — and its payload stream was written out untouched. The walk
+      now runs first; the catalog is tidied afterwards. Added a final sweep that
+      empties any `/Type /EmbeddedFile` stream nothing points at any more.
+      Verified: a 3 000-byte marker payload is absent from the output bytes.
+- [x] **The attachment count was wrong.** Deleting the name tree *and* each file
+      specification both bumped the counter, so one attachment was reported as
+      “−2 embedded files”. Only real specifications are counted now.
+- [x] **Metadata was always reported as removed**, even when there was none —
+      `trailerInfo.Info` was cleared and counted unconditionally.
+- [x] **The result is parsed before it replaces the working copy.** If the
+      cleaned file cannot be read back, nothing is applied, the document is left
+      untouched and the user is told so (`df_broken`).
+- [x] **The headline now follows the verification, not the change log.** With
+      options unticked the tool used to claim “The document has been
+      neutralised” while two HIGH findings remained. Three honest variants:
+      neutralised / partly cleaned / nothing to take out.
+- [x] **Rasterise is time-boxed and checked.** It is the option the tool itself
+      recommends for certainty, so a renderer that stalls or produces no pages
+      now fails loudly and applies nothing, instead of spinning forever.
+- [x] Page-count mismatch between pdf.js and pdf-lib guarded in the raster loop;
+      disabled links de-duplicated and capped in the report.
+
+Verified: hostile fixture (catalog `OpenAction`, catalog `/AA`, a
+`/Names/JavaScript` tree, an inline `/A` URI action, `Launch`, `GoToR`, a
+`Screen` annotation, page-level `/AA` and a real attachment) → `clean`, 0
+findings, 0 scripts, 0 URLs, payload gone, banner cleared — identically in
+EN/FR/NL with no raw keys, no overflow and no console errors. Orphaned indirect
+actions (reachable only through an `/AA` that gets deleted) are also neutralised,
+confirmed by marker strings being absent from the saved bytes.
+
 ## Round 6 — accuracy & usability audit (2026-08-07) ✅
 
 A pass over every claim the app makes, checking that it is actually true.

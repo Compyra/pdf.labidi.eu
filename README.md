@@ -11,6 +11,10 @@ and after the first visit the whole app works offline (PWA).
 - **Stateful workspace** — open a PDF once, chain any number of tools; every
   transform auto-applies to the working copy with full undo/redo
   (`Ctrl+Z`/`Ctrl+Y`, `Ctrl+O` to open, `Ctrl+S` to download).
+- **Built-in viewer** — the 👁 button in the file chip (and on every result
+  card) opens a side panel showing the document as it is *right now*. It
+  refreshes after each tool, so you can check the change before downloading.
+  Pages are drawn as you scroll, so long documents open instantly.
 - **54 tools** in five groups:
   - *Pages & organisation* — merge (PDFs **and** images, optional bookmark
     per file), split (ranges / every N / **max file size** / bookmarks),
@@ -70,6 +74,8 @@ ever executed; this page has no way to run PDF JavaScript.
   change log of exactly what was removed, plus the defanged list of every link
   that was disabled — and the result is **re-scanned afterwards**, so the tool
   either confirms nothing active is left or tells you plainly what remains.
+  The cleaned file is parsed before it replaces your working copy: if it cannot
+  be read back, nothing is applied and your document stays untouched.
 
 Severity is graded conservatively: an ordinary `https://` link is *low*, and a
 rating is only raised when there is a concrete reason, which is always shown

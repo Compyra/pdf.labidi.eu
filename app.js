@@ -1028,38 +1028,87 @@
     let previewOpen = false;
     let previewZoom = 1;
     let previewToken = 0;
+    let previewOnScroll = null;
 
     async function renderPreview() {
         const host = $('#pv-pages');
+        if (previewOnScroll) { host.removeEventListener('scroll', previewOnScroll); previewOnScroll = null; }
         host.textContent = '';
         $('#pv-zoom-label').textContent = Math.round(previewZoom * 100) + '%';
-        if (!state.bytes) return;
+        if (!state.bytes) { $('#pv-count').textContent = ''; return; }
         const my = ++previewToken;
         try {
             const doc = await getDoc();
-            const width = Math.min(560, (host.clientWidth || 300) - 8) * previewZoom;
-            const max = Math.min(doc.numPages, 120);
-            for (let i = 0; i < max; i++) {
-                if (my !== previewToken) return;
-                const { canvas } = await renderPage(doc, i, { targetWidth: Math.max(80, width) });
-                if (my !== previewToken) return;
-                host.appendChild(canvas);
+            if (my !== previewToken) return;
+            $('#pv-count').textContent = t('pv_pages', { n: doc.numPages });
+            // fits the panel at 100%; beyond that the panel scrolls sideways
+            const width = Math.max(80, Math.min(560, (host.clientWidth || 320) - 32) * previewZoom);
+            host.classList.toggle('is-zoomed', previewZoom > 1);
+            // one page's shape is enough to reserve space for the rest
+            const vp = (await doc.getPage(1)).getViewport({ scale: 1 });
+            const ratio = vp.height / vp.width;
+
+            const slots = [];
+            for (let i = 0; i < doc.numPages; i++) {
+                const slot = el('div', { class: 'pv-slot', dataset: { i: String(i) } });
+                slot.style.width = Math.round(width) + 'px';
+                slot.style.height = Math.round(width * ratio) + 'px';
+                host.appendChild(slot);
                 host.appendChild(el('div', { class: 'pv-num' }, String(i + 1) + ' / ' + doc.numPages));
+                slots.push(slot);
             }
-        } catch (e) { console.error(e); }
+
+            const draw = (slot) => {
+                if (slot.dataset.done) return;
+                slot.dataset.done = '1';
+                renderPage(doc, +slot.dataset.i, { targetWidth: width }).then(({ canvas }) => {
+                    if (my !== previewToken) return;
+                    slot.textContent = '';
+                    slot.style.height = 'auto';
+                    slot.appendChild(canvas);
+                }).catch(() => { slot.classList.add('is-failed'); });
+            };
+            /* Only what is near the viewport gets drawn: rendering a 200-page
+               document up front would freeze the panel for a long time. */
+            const drawVisible = () => {
+                const from = host.scrollTop - 400;
+                const to = host.scrollTop + host.clientHeight + 400;
+                for (const slot of slots) {
+                    if (slot.dataset.done) continue;
+                    if (slot.offsetTop <= to && slot.offsetTop + slot.offsetHeight >= from) draw(slot);
+                }
+            };
+
+            let raf = 0;
+            previewOnScroll = () => {
+                if (raf) return;
+                raf = requestAnimationFrame(() => { raf = 0; if (my === previewToken) drawVisible(); });
+            };
+            host.addEventListener('scroll', previewOnScroll);
+            drawVisible();
+        } catch (e) {
+            host.appendChild(el('p', { class: 'hint', text: t('pv_failed') }));
+        }
     }
 
     function openPreview() {
         if (!state.bytes) return;
         previewOpen = true;
         $('#preview').hidden = false;
+        const btn = $('#ws-view');
+        if (btn) btn.setAttribute('aria-pressed', 'true');
         renderPreview();
     }
     function closePreview() {
         previewOpen = false;
         previewToken++;
+        const host = $('#pv-pages');
+        if (previewOnScroll) { host.removeEventListener('scroll', previewOnScroll); previewOnScroll = null; }
         $('#preview').hidden = true;
+        const btn = $('#ws-view');
+        if (btn) btn.setAttribute('aria-pressed', 'false');
     }
+    function togglePreview() { return previewOpen ? closePreview() : openPreview(); }
 
     /* -------------------------------------------------------- UI blocks -- */
     function field(labelKey, control, hintKey) {
@@ -1251,6 +1300,7 @@
                     el('p', { class: 'res-title', text: t('res_applied') }),
                     el('div', { class: 'btn-row' },
                         el('button', { type: 'button', class: 'btn btn-primary', onclick: () => download(state.bytes, outName, 'application/pdf') }, t('btn_download') + ' — ' + outName),
+                        el('button', { type: 'button', class: 'btn', onclick: openPreview }, '👁 ' + t('btn_view')),
                         el('span', { class: 'fr-size', text: fmtSize(bytes.length) }))));
                 toast(t('toast_applied'), 'ok');
             },
@@ -1566,7 +1616,8 @@
         $('#ws-redo').addEventListener('click', redo);
         $('#ws-close').addEventListener('click', closeWorkspace);
         $('#ws-download').addEventListener('click', () => state.bytes && download(state.bytes, state.name, 'application/pdf'));
-        $('#ws-open-preview').addEventListener('click', () => (previewOpen ? closePreview() : openPreview()));
+        $('#ws-open-preview').addEventListener('click', togglePreview);
+        $('#ws-view').addEventListener('click', togglePreview);
         $('#pv-close').addEventListener('click', closePreview);
         $('#pv-zoom-in').addEventListener('click', () => { previewZoom = Math.min(3, previewZoom + 0.25); renderPreview(); });
         $('#pv-zoom-out').addEventListener('click', () => { previewZoom = Math.max(0.5, previewZoom - 0.25); renderPreview(); });
@@ -1625,6 +1676,7 @@
         t, el, field, input, select, segmented, check, pagesField, filePicker,
         makeRunner, runButton, workspaceGate, baseName,
         state, setWorkspace, loadWorkspaceFile, undo, redo,
+        openPreview, closePreview, togglePreview,
         getDoc, pdfjsDocFor, renderPage, replacePagesWithImages,
         parseRanges, download, zipMake, zipRead, crc32, fmtSize, toast,
         deflateRaw, inflateRaw, inflateZlib, aesEncrypt, aesDecrypt, cryptoOk,

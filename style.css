@@ -196,9 +196,20 @@ select:focus-visible, textarea:focus-visible, [tabindex]:focus-visible {
 }
 .preview-bar { display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .6rem .8rem; border-bottom: 1px solid var(--line); }
 .preview-tools { display: flex; align-items: center; gap: .35rem; font-size: .8rem; color: var(--muted); }
-.preview-pages { flex: 1; overflow-y: auto; padding: .8rem; display: flex; flex-direction: column; gap: .8rem; align-items: center; }
-.preview-pages canvas { max-width: 100%; height: auto; border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.35); background: #fff; }
-.pv-num { color: var(--muted); font-size: .7rem; margin-top: -.5rem; }
+.preview-pages { flex: 1; overflow: auto; padding: .8rem; display: flex; flex-direction: column; gap: .8rem; align-items: safe center; position: relative; }
+/* flex: none — a column flex container would otherwise shrink every page to
+   fit the panel height instead of letting the list scroll */
+.preview-pages canvas { flex: none; height: auto; border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.35); background: #fff; }
+/* Clamped until the user zooms in — past 100% the panel scrolls sideways
+   instead, otherwise the zoom button would visibly do nothing. */
+.preview-pages:not(.is-zoomed) .pv-slot,
+.preview-pages:not(.is-zoomed) canvas { max-width: 100%; }
+.pv-num { flex: none; color: var(--muted); font-size: .7rem; margin-top: -.5rem; position: sticky; left: 0; }
+.pv-count { font-variant-numeric: tabular-nums; margin-right: .2rem; white-space: nowrap; }
+/* placeholder that holds the page's space until it scrolls into view */
+.pv-slot { flex: none; border-radius: 6px; background: color-mix(in srgb, var(--panel) 70%, transparent); border: 1px dashed var(--line); }
+.pv-slot.is-failed { border-style: solid; border-color: var(--err); }
+.pv-slot canvas { display: block; }
 
 /* ----------------------------------------------------------------- home -- */
 .hero { margin: 0 0 1.4rem; }
@@ -507,6 +518,8 @@ table.kv td:last-child { overflow-wrap: anywhere; word-break: break-word; }
     .ws-file { max-width: 30vw; }
     .tool-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
     .dropzone-inner { padding: 2rem; }
+    /* the close button must never be squeezed out; each page is numbered anyway */
+    .pv-count { display: none; }
 }
 
 /* With a file open there is no room for the brand, the filename, undo/redo
