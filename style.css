@@ -217,6 +217,7 @@ select:focus-visible, textarea:focus-visible, [tabindex]:focus-visible {
 
 .tool-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: .7rem; margin: .8rem 0 1.6rem; }
 .tool-card {
+    position: relative;
     display: flex; flex-direction: column; gap: .35rem; padding: .85rem .9rem;
     border: 1px solid var(--line); border-radius: 12px;
     background: var(--panel); color: inherit; text-decoration: none;
@@ -224,8 +225,19 @@ select:focus-visible, textarea:focus-visible, [tabindex]:focus-visible {
 }
 .tool-card:hover { background: var(--panel-2); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); transform: translateY(-1px); }
 .tool-card .t-ico { font-size: 1.25rem; }
-.tool-card strong { font-size: .88rem; }
+.tool-card strong { font-size: .88rem; padding-right: 1.4rem; }
 .tool-card small { color: var(--muted); font-size: .73rem; line-height: 1.35; }
+
+.fav-star {
+    position: absolute; top: .45rem; right: .45rem;
+    border: 0; background: none; color: var(--muted);
+    font: inherit; font-size: 1rem; line-height: 1; cursor: pointer;
+    padding: .25rem; border-radius: 8px;
+}
+.fav-star:hover { color: var(--accent-2); background: var(--panel-2); }
+.fav-star.is-fav { color: var(--accent-2); }
+.tool-head { position: relative; }
+.tool-head .fav-star { position: static; margin-left: auto; font-size: 1.25rem; flex: none; }
 
 .home-cat { margin: 1.6rem 0 .4rem; font-size: .95rem; color: var(--accent-2); }
 

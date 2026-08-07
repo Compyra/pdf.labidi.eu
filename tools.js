@@ -78,12 +78,30 @@
         return { x, y };
     }
 
+    /* Bytes of a user-picked PDF, prompting for the password when encrypted.
+       Without this, pdf-lib silently copies still-encrypted (garbage) pages. */
+    async function pickedPdfBytes(file) {
+        let bytes = await readBytes(file);
+        const probe = await loadLib(bytes);
+        if (!probe.isEncrypted) return bytes;
+        for (;;) {
+            const pw = await A.askPassword(file.name);
+            if (pw === null) throw new Error(t('err_needpw'));
+            try {
+                const dec = await PDFLib.PDFDocument.load(bytes, { password: pw, updateMetadata: false, throwOnInvalidObject: false });
+                const out = await dec.save();
+                return out instanceof Uint8Array ? out : new Uint8Array(out);
+            } catch (e) { A.toast(t('pw_wrong'), 'err'); }
+        }
+    }
+
     /* ------------------------------------------------- page-nav + canvas -- */
     /* Renders one page of the working copy with ‹ › navigation. onDraw(ctx)
        is called after each render so callers can decorate the overlay. */
     function pageStage(host, opts) {
         const o = opts || {};
         let pageIndex = 0;
+        let drawToken = 0;
         const label = el('span', { class: 'fr-size' });
         const wrap = el('div', { class: 'place-wrap' });
         const prev = el('button', { type: 'button', class: 'icon-btn', 'aria-label': '‹' }, '‹');
@@ -93,6 +111,7 @@
         host.appendChild(wrap);
         let canvas = null;
         async function draw() {
+            const my = ++drawToken;
             const doc = await A.getDoc();
             const n = doc.numPages;
             pageIndex = Math.max(0, Math.min(n - 1, pageIndex));
@@ -100,6 +119,7 @@
             prev.disabled = pageIndex === 0;
             next.disabled = pageIndex >= n - 1;
             const r = await A.renderPage(doc, pageIndex, { targetWidth: o.width || 520 });
+            if (my !== drawToken) return;   // a newer draw superseded this one
             if (canvas) canvas.remove();
             canvas = r.canvas;
             canvas.className = 'pw-page';
@@ -109,6 +129,11 @@
         prev.addEventListener('click', () => { pageIndex--; draw(); });
         next.addEventListener('click', () => { pageIndex++; draw(); });
         draw();
+        // stay in sync after apply/undo/redo while this stage is on screen
+        document.addEventListener('pdfstudio:workspace', function h() {
+            if (!document.body.contains(wrap)) { document.removeEventListener('pdfstudio:workspace', h); return; }
+            if (A.state.bytes) draw();
+        });
         return { get pageIndex() { return pageIndex; }, redraw: draw, wrap };
     }
 
@@ -211,12 +236,12 @@
     }
 
     /* rasterize chosen pages through a pixel/canvas transform → new bytes */
-    async function rasterTransform(indices, dpi, quality, mutate, progress) {
+    async function rasterTransform(indices, dpi, quality, mutate, progress, opts) {
         const doc = await A.getDoc();
         const map = new Map();
         let k = 0;
         for (const i of indices) {
-            const { canvas } = await A.renderPage(doc, i, { dpi, willRead: true });
+            const { canvas } = await A.renderPage(doc, i, Object.assign({ dpi, willRead: true }, opts || {}));
             mutate(canvas, i);
             map.set(i, canvas);
             if (progress) progress(++k / indices.length);
@@ -231,6 +256,39 @@
         ctx.putImageData(img, 0, 0);
     }
 
+    function toRoman(num) {
+        const map = [[1000, 'm'], [900, 'cm'], [500, 'd'], [400, 'cd'], [100, 'c'], [90, 'xc'],
+            [50, 'l'], [40, 'xl'], [10, 'x'], [9, 'ix'], [5, 'v'], [4, 'iv'], [1, 'i']];
+        let out = '';
+        for (const [v, s] of map) while (num >= v) { out += s; num -= v; }
+        return out;
+    }
+
+    /* Write a flat, single-level outline (bookmarks). items: [{title, page}].
+       Empty items removes the outline entirely. */
+    function writeOutline(doc, items) {
+        const N = PDFLib.PDFName.of.bind(PDFLib.PDFName);
+        if (!items.length) { doc.catalog.delete(N('Outlines')); return; }
+        const ctx = doc.context;
+        const refs = items.map(() => ctx.nextRef());
+        const outlineRef = ctx.nextRef();
+        items.forEach((it, i) => {
+            const page = doc.getPage(Math.max(0, Math.min(doc.getPageCount() - 1, it.page)));
+            const d = ctx.obj({
+                Title: PDFLib.PDFHexString.fromText(it.title || 'Bookmark'),
+                Parent: outlineRef,
+                Dest: [page.ref, N('Fit')],
+            });
+            if (i > 0) d.set(N('Prev'), refs[i - 1]);
+            if (i < items.length - 1) d.set(N('Next'), refs[i + 1]);
+            ctx.assign(refs[i], d);
+        });
+        ctx.assign(outlineRef, ctx.obj({
+            Type: 'Outlines', First: refs[0], Last: refs[refs.length - 1], Count: items.length,
+        }));
+        doc.catalog.set(N('Outlines'), outlineRef);
+    }
+
     const reg = (def) => A.registerTool(def);
 
     /* ========================================================== ORGANIZE == */
@@ -241,14 +299,16 @@
             const body = el('div', { class: 'tool-body' });
             view.appendChild(body);
             const card = el('div', { class: 'card' });
-            const picker = A.filePicker({ sortable: true });
+            const picker = A.filePicker({ sortable: true, accept: 'application/pdf,.pdf,image/*' });
             card.appendChild(picker);
-            card.appendChild(el('p', { class: 'hint', text: t('merge_hint') }));
+            card.appendChild(el('p', { class: 'hint', text: t('merge_hint') + ' ' + t('merge_mixed') }));
             let inclWs = null;
             if (A.state.bytes) {
                 inclWs = A.check('merge_use_ws', true);
                 card.appendChild(inclWs);
             }
+            const addBm = A.check('merge_bm', false);
+            card.appendChild(addBm);
             body.appendChild(card);
             const runner = A.makeRunner(body);
             body.insertBefore(el('div', { class: 'btn-row' }, A.runButton('btn_run', async () => {
@@ -259,15 +319,28 @@
                     if (files.length + (useWs ? 1 : 0) < 2) { A.toast(t('merge_need2'), 'err'); return; }
                     const out = await PDFLib.PDFDocument.create();
                     const sources = [];
-                    if (useWs) sources.push(A.state.bytes);
-                    for (const f of files) sources.push(await readBytes(f));
+                    if (useWs) sources.push({ bytes: A.state.bytes, name: A.state.name, isPdf: true });
+                    for (const f of files) {
+                        const isPdf = /\.pdf$/i.test(f.name) || f.type === 'application/pdf';
+                        sources.push({ bytes: isPdf ? await pickedPdfBytes(f) : await readBytes(f), name: f.name, isPdf });
+                    }
+                    const marks = [];
                     let done = 0;
                     for (const src of sources) {
-                        const d = await loadLib(src);
-                        const pages = await out.copyPages(d, d.getPageIndices());
-                        pages.forEach((p) => out.addPage(p));
+                        marks.push({ title: src.name.replace(/\.[a-z0-9]+$/i, ''), page: out.getPageCount() });
+                        if (src.isPdf) {
+                            const d = await loadLib(src.bytes);
+                            const pages = await out.copyPages(d, d.getPageIndices());
+                            pages.forEach((p) => out.addPage(p));
+                        } else {
+                            // images become one page each, sized to the picture
+                            const img = await embedImageAuto(out, src.bytes);
+                            const w = img.width * 72 / 96, h = img.height * 72 / 96;
+                            out.addPage([w, h]).drawImage(img, { x: 0, y: 0, width: w, height: h });
+                        }
                         runner.progress(++done / sources.length);
                     }
+                    if (addBm.input.checked) writeOutline(out, marks);
                     const bytes = await out.save();
                     await runner.applied(bytes, { name: 'merged.pdf', downloadName: 'merged.pdf' });
                 } catch (e) { runner.error(e); }
@@ -282,20 +355,26 @@
                 const card = el('div', { class: 'card' });
                 const rangesInp = A.input('text', { placeholder: '1-3; 4-6; 7-' });
                 const everyInp = A.input('number', { value: '2', min: '1' });
+                const sizeInp = A.input('number', { value: '10', min: '1', step: '1' });
                 const rangesField = A.field('split_ranges', rangesInp, 'split_ranges_hint');
                 const everyField = A.field('split_every_n', everyInp);
+                const sizeField = A.field('split_size', sizeInp, 'split_size_hint');
                 const seg = A.segmented([
                     { value: 'ranges', label: t('split_ranges') },
                     { value: 'every', label: t('split_every') },
+                    { value: 'size', label: t('split_size') },
                     { value: 'bookmarks', label: t('split_bookmarks') },
                 ], 'ranges', (v) => {
                     rangesField.style.display = v === 'ranges' ? '' : 'none';
                     everyField.style.display = v === 'every' ? '' : 'none';
+                    sizeField.style.display = v === 'size' ? '' : 'none';
                 });
                 everyField.style.display = 'none';
+                sizeField.style.display = 'none';
                 card.appendChild(A.field('split_mode', seg));
                 card.appendChild(rangesField);
                 card.appendChild(everyField);
+                card.appendChild(sizeField);
                 body.appendChild(card);
                 const runner = A.makeRunner(body);
                 body.insertBefore(el('div', { class: 'btn-row' }, A.runButton('btn_run', async () => {
@@ -309,6 +388,25 @@
                         if (mode === 'every') {
                             const step = Math.max(1, +everyInp.value || 1);
                             for (let i = 0; i < n; i += step) groups.push({ name: base + '-' + (groups.length + 1) + '.pdf', idx: Array.from({ length: Math.min(step, n - i) }, (_, k) => i + k) });
+                        } else if (mode === 'size') {
+                            // greedy page packing measured by real incremental saves
+                            const limit = Math.max(0.2, +sizeInp.value || 10) * 1024 * 1024;
+                            const parts = [];
+                            let cur = [];
+                            for (let i = 0; i < n; i++) {
+                                cur.push(i);
+                                const trial = await PDFLib.PDFDocument.create();
+                                (await trial.copyPages(src, cur)).forEach((p) => trial.addPage(p));
+                                const sz = (await trial.save()).length;
+                                if (sz > limit && cur.length > 1) {
+                                    cur.pop();
+                                    parts.push(cur);
+                                    cur = [i];
+                                }
+                                runner.progress((i + 1) / n * 0.7);
+                            }
+                            if (cur.length) parts.push(cur);
+                            groups = parts.map((idx, gi) => ({ name: base + '-' + (gi + 1) + '.pdf', idx }));
                         } else if (mode === 'bookmarks') {
                             const doc = await A.getDoc();
                             const outline = await doc.getOutline();
@@ -335,20 +433,200 @@
                             }
                         } else {
                             const spec = rangesInp.value.trim();
-                            const parts = spec ? spec.split(';') : Array.from({ length: n }, (_, i) => String(i + 1));
-                            groups = parts.map((p, gi) => ({ name: base + '-' + (gi + 1) + '.pdf', idx: A.parseRanges(p, n) })).filter((g) => g.idx.length);
+                            // drop empty/garbage segments — parseRanges('') would mean "all pages"
+                            const parts = spec
+                                ? spec.split(';').map((s) => s.trim()).filter(Boolean)
+                                : Array.from({ length: n }, (_, i) => String(i + 1));
+                            groups = parts
+                                .map((p, gi) => ({ name: base + '-' + (gi + 1) + '.pdf', idx: A.parseRanges(p, n) }))
+                                .filter((g) => g.idx.length);
                         }
                         const files = [];
                         let done = 0;
+                        const packBase = mode === 'size' ? 0.7 : 0;
+                        if (!groups.length) { A.toast(t('hint_pages'), 'err'); runner.done(); return; }
                         for (const g of groups) {
                             const out = await PDFLib.PDFDocument.create();
                             const pages = await out.copyPages(src, g.idx);
                             pages.forEach((p) => out.addPage(p));
                             files.push({ name: g.name, bytes: await out.save(), mime: 'application/pdf' });
-                            runner.progress(++done / groups.length);
+                            runner.progress(packBase + (++done / groups.length) * (1 - packBase));
                         }
                         const card2 = runner.files(files);
                         card2.insertBefore(el('p', { class: 'hint', text: t('split_parts', { n: files.length }) }), card2.children[1]);
+                    } catch (e) { runner.error(e); }
+                })), runner.host);
+            });
+        },
+    });
+
+    reg({
+        id: 'mix', key: 'mix', cat: 'organize', icon: '🔀',
+        build(view) {
+            const body = el('div', { class: 'tool-body' });
+            view.appendChild(body);
+            body.appendChild(el('p', { class: 'hint', text: t('mix_note') }));
+            const card = el('div', { class: 'card' });
+            const pickA = A.filePicker({ multiple: false, labelKey: 'btn_choose' });
+            const pickB = A.filePicker({ multiple: false, labelKey: 'btn_choose' });
+            const fa = A.field(null, pickA);
+            fa.insertBefore(el('label', { text: t('mix_a') }), fa.firstChild);
+            const fb = A.field(null, pickB);
+            fb.insertBefore(el('label', { text: t('mix_b') }), fb.firstChild);
+            const rev = A.check('mix_rev', true);
+            card.appendChild(el('div', { class: 'field-row' }, fa, fb));
+            card.appendChild(rev);
+            body.appendChild(card);
+            const runner = A.makeRunner(body);
+            body.insertBefore(el('div', { class: 'btn-row' }, A.runButton('btn_run', async () => {
+                try {
+                    runner.clear();
+                    if (!pickA.getFiles().length || !pickB.getFiles().length) { A.toast(t('mix_need'), 'err'); return; }
+                    const da = await loadLib(await pickedPdfBytes(pickA.getFiles()[0]));
+                    const db = await loadLib(await pickedPdfBytes(pickB.getFiles()[0]));
+                    const out = await PDFLib.PDFDocument.create();
+                    const pa = await out.copyPages(da, da.getPageIndices());
+                    let pb = await out.copyPages(db, db.getPageIndices());
+                    if (rev.input.checked) pb = pb.reverse();
+                    const max = Math.max(pa.length, pb.length);
+                    for (let i = 0; i < max; i++) {
+                        if (i < pa.length) out.addPage(pa[i]);
+                        if (i < pb.length) out.addPage(pb[i]);
+                        runner.progress((i + 1) / max);
+                    }
+                    await runner.applied(await out.save(), { name: 'mixed.pdf', downloadName: 'mixed.pdf' });
+                } catch (e) { runner.error(e); }
+            })), runner.host);
+        },
+    });
+
+    reg({
+        id: 'insert', key: 'insert', cat: 'organize', icon: '📥',
+        build(view) {
+            A.workspaceGate(view, (body) => {
+                const card = el('div', { class: 'card' });
+                const pos = A.input('number', { value: String(A.state.pageCount), min: '0' });
+                const posField = A.field('ins_after', pos, 'ins_after_hint');
+                const count = A.input('number', { value: '1', min: '1', max: '200' });
+                const countField = A.field('ins_count', count);
+                const every = A.check('ins_every', false);
+                const picker = A.filePicker({ multiple: false, labelKey: 'btn_choose' });
+                const fileField = A.field('ins_file', picker);
+                fileField.style.display = 'none';
+                const mode = A.segmented([
+                    { value: 'blank', label: t('ins_mode_blank') }, { value: 'pdf', label: t('ins_mode_pdf') },
+                ], 'blank', (v) => {
+                    countField.style.display = v === 'blank' ? '' : 'none';
+                    every.style.display = v === 'blank' ? '' : 'none';
+                    fileField.style.display = v === 'pdf' ? '' : 'none';
+                    posField.style.display = (v === 'blank' && every.input.checked) ? 'none' : '';
+                });
+                every.input.addEventListener('change', () => { posField.style.display = every.input.checked ? 'none' : ''; });
+                card.appendChild(A.field(null, mode));
+                card.appendChild(posField);
+                card.appendChild(countField);
+                card.appendChild(every);
+                card.appendChild(fileField);
+                body.appendChild(card);
+                const runner = A.makeRunner(body);
+                body.insertBefore(el('div', { class: 'btn-row' }, A.runButton('btn_apply', async () => {
+                    try {
+                        runner.clear();
+                        const src = await loadLib(A.state.bytes);
+                        const n = src.getPageCount();
+                        const out = await PDFLib.PDFDocument.create();
+                        const basePages = await out.copyPages(src, src.getPageIndices());
+                        const sizeAt = (i) => {
+                            const p = src.getPage(Math.max(0, Math.min(n - 1, i)));
+                            return [p.getWidth(), p.getHeight()];
+                        };
+                        if (mode.getValue() === 'blank' && every.input.checked) {
+                            basePages.forEach((p, i) => { out.addPage(p); out.addPage(sizeAt(i)); });
+                        } else {
+                            const at = Math.max(0, Math.min(n, +pos.value || 0));
+                            for (let i = 0; i < at; i++) out.addPage(basePages[i]);
+                            if (mode.getValue() === 'blank') {
+                                const c = Math.max(1, +count.value || 1);
+                                for (let k = 0; k < c; k++) out.addPage(sizeAt(at === 0 ? 0 : at - 1));
+                            } else {
+                                if (!picker.getFiles().length) { A.toast(t('ins_need'), 'err'); return; }
+                                const ins = await loadLib(await pickedPdfBytes(picker.getFiles()[0]));
+                                (await out.copyPages(ins, ins.getPageIndices())).forEach((p) => out.addPage(p));
+                            }
+                            for (let i = at; i < n; i++) out.addPage(basePages[i]);
+                        }
+                        await runner.applied(await out.save());
+                    } catch (e) { runner.error(e); }
+                })), runner.host);
+            });
+        },
+    });
+
+    reg({
+        id: 'headers-footers', key: 'hf', cat: 'organize', icon: '📰',
+        build(view) {
+            A.workspaceGate(view, (body) => {
+                body.appendChild(el('p', { class: 'hint', text: t('hf_vars') }));
+                const card = el('div', { class: 'card' });
+                const slots = {};
+                for (const rowKey of ['header', 'footer']) {
+                    const row = el('div', { class: 'field-row' });
+                    for (const colKey of ['l', 'c', 'r']) {
+                        const inp = A.input('text', { autocomplete: 'off', spellcheck: 'false' });
+                        slots[rowKey + colKey] = inp;
+                        const f = A.field(null, inp);
+                        f.insertBefore(el('label', { text: t('hf_' + rowKey) + ' — ' + t('hf_' + colKey) }), f.firstChild);
+                        row.appendChild(f);
+                    }
+                    card.appendChild(row);
+                }
+                slots.footerc.value = '{n} / {total}';
+                const size = A.input('number', { value: '9', min: '5', max: '24' });
+                const margin = A.input('number', { value: '24', min: '8', max: '120' });
+                const batesStart = A.input('number', { value: '1', min: '0' });
+                const batesDigits = A.input('number', { value: '6', min: '3', max: '10' });
+                card.appendChild(el('div', { class: 'field-row' },
+                    A.field('opt_fontsize', size), A.field('opt_margin', margin),
+                    A.field('hf_bates_start', batesStart), A.field('hf_bates_digits', batesDigits)));
+                const pages = A.pagesField();
+                card.appendChild(pages);
+                body.appendChild(card);
+                const runner = A.makeRunner(body);
+                body.insertBefore(el('div', { class: 'btn-row' }, A.runButton('btn_apply', async () => {
+                    try {
+                        runner.clear();
+                        if (!Object.values(slots).some((inp) => inp.value.trim())) { A.toast(t('hf_vars'), 'err'); return; }
+                        const doc = await loadLib(A.state.bytes);
+                        const font = await doc.embedFont(PDFLib.StandardFonts.Helvetica);
+                        const idx = pages.getIndices(doc.getPageCount());
+                        const fs = +size.value || 9;
+                        const mg = +margin.value || 24;
+                        const date = new Date().toLocaleDateString(PDFI18N.lang);
+                        const fname = A.state.name;
+                        let bates = Math.max(0, +batesStart.value || 1);
+                        const digits = Math.max(3, +batesDigits.value || 6);
+                        const total = doc.getPageCount();
+                        idx.forEach((i) => {
+                            const p = doc.getPage(i);
+                            const W = p.getWidth(), H = p.getHeight();
+                            const fill = (tpl) => A.winAnsiSafe(String(tpl)
+                                .split('{n}').join(String(i + 1))
+                                .split('{total}').join(String(total))
+                                .split('{date}').join(date)
+                                .split('{file}').join(fname)
+                                .split('{bates}').join(String(bates).padStart(digits, '0')));
+                            for (const [slot, inp] of Object.entries(slots)) {
+                                const raw = inp.value.trim();
+                                if (!raw) continue;
+                                const str = fill(raw);
+                                const tw = font.widthOfTextAtSize(str, fs);
+                                const x = slot.endsWith('l') ? mg : slot.endsWith('r') ? W - tw - mg : (W - tw) / 2;
+                                const y = slot.startsWith('header') ? H - mg : mg - fs / 2;
+                                p.drawText(str, { x, y, size: fs, font, color: PDFLib.rgb(0.25, 0.25, 0.28) });
+                            }
+                            bates++;
+                        });
+                        await runner.applied(await doc.save());
                     } catch (e) { runner.error(e); }
                 })), runner.host);
             });
@@ -444,6 +722,7 @@
                 items = Array.from({ length: doc.numPages }, (_, i) => ({ src: i, rot: 0, thumb: null }));
                 redraw();
                 for (let i = 0; i < Math.min(items.length, 200); i++) {
+                    if (!document.body.contains(grid)) return;   // user navigated away
                     const { canvas } = await A.renderPage(doc, i, { targetWidth: 150 });
                     items[i].thumb = canvas;
                     if (i % 4 === 3 || i === items.length - 1) redraw();
@@ -488,16 +767,17 @@
         build(view) {
             A.workspaceGate(view, (body) => {
                 const card = el('div', { class: 'card' });
-                const inp = A.input('text', { placeholder: t('hint_pages') });
-                card.appendChild(A.field('rm_label', inp, 'hint_pages'));
+                const inp = A.input('text', { placeholder: t('hint_pages_req') });
+                card.appendChild(A.field('rm_label', inp, 'hint_pages_req'));
                 body.appendChild(card);
                 const runner = A.makeRunner(body);
                 body.insertBefore(el('div', { class: 'btn-row' }, A.runButton('btn_apply', async () => {
                     try {
                         runner.clear();
+                        if (!inp.value.trim()) { A.toast(t('rm_empty'), 'err'); return; }
                         const src = await loadLib(A.state.bytes);
                         const n = src.getPageCount();
-                        const rm = new Set(A.parseRanges(inp.value || '', n));
+                        const rm = new Set(A.parseRanges(inp.value, n));
                         const keep = Array.from({ length: n }, (_, i) => i).filter((i) => !rm.has(i));
                         if (!keep.length) { A.toast(t('rm_all_err'), 'err'); return; }
                         const out = await PDFLib.PDFDocument.create();
@@ -544,6 +824,8 @@
                 let found = [];
                 const removeBtn = el('button', { type: 'button', class: 'btn btn-primary', hidden: true }, t('rb_remove'));
                 removeBtn.addEventListener('click', async () => {
+                    if (removeBtn.disabled) return;
+                    removeBtn.disabled = true;
                     try {
                         const src = await loadLib(A.state.bytes);
                         const keep = src.getPageIndices().filter((i) => !found.includes(i));
@@ -551,8 +833,10 @@
                         const out = await PDFLib.PDFDocument.create();
                         (await out.copyPages(src, keep)).forEach((p) => out.addPage(p));
                         removeBtn.hidden = true;
+                        found = [];
                         await runner.applied(await out.save());
                     } catch (e) { runner.error(e); }
+                    finally { removeBtn.disabled = false; }
                 });
                 body.insertBefore(el('div', { class: 'btn-row' }, A.runButton('rb_scan', async () => {
                     try {
@@ -648,7 +932,51 @@
                     },
                 });
                 for (const k of Object.keys(nums)) nums[k].addEventListener('input', syncRect);
-                card.appendChild(el('div', { class: 'btn-row' }, el('button', {
+                const autoBtn = el('button', { type: 'button', class: 'btn' }, '✨ ' + t('crop_auto'));
+                autoBtn.addEventListener('click', async () => {
+                    autoBtn.disabled = true;
+                    try {
+                        // union ink bbox across sampled pages → margins with 6pt padding
+                        const doc = await A.getDoc();
+                        const n = doc.numPages;
+                        const sample = n <= 16 ? Array.from({ length: n }, (_, i) => i)
+                            : Array.from({ length: 16 }, (_, i) => Math.floor(i * (n - 1) / 15));
+                        let bb = null;
+                        let ref = null;
+                        for (const i of sample) {
+                            const { canvas, page } = await A.renderPage(doc, i, { dpi: 50, willRead: true });
+                            const vp = page.getViewport({ scale: 1 });
+                            if (!ref) ref = vp;
+                            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                            const d = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+                            let x0 = canvas.width, y0 = canvas.height, x1 = -1, y1 = -1;
+                            for (let y = 0; y < canvas.height; y++) {
+                                for (let x = 0; x < canvas.width; x++) {
+                                    const p = (y * canvas.width + x) * 4;
+                                    if ((d[p] * 0.299 + d[p + 1] * 0.587 + d[p + 2] * 0.114) < 242) {
+                                        if (x < x0) x0 = x;
+                                        if (x > x1) x1 = x;
+                                        if (y < y0) y0 = y;
+                                        if (y > y1) y1 = y;
+                                    }
+                                }
+                            }
+                            if (x1 < 0) continue;
+                            const s = vp.width / canvas.width;
+                            const box = { l: x0 * s, t: y0 * s, r: vp.width - (x1 + 1) * s, b: vp.height - (y1 + 1) * s };
+                            bb = bb ? { l: Math.min(bb.l, box.l), t: Math.min(bb.t, box.t), r: Math.min(bb.r, box.r), b: Math.min(bb.b, box.b) } : box;
+                        }
+                        if (bb) {
+                            const pad = 6;
+                            nums.l.value = Math.max(0, Math.round(bb.l - pad));
+                            nums.t.value = Math.max(0, Math.round(bb.t - pad));
+                            nums.r.value = Math.max(0, Math.round(bb.r - pad));
+                            nums.b.value = Math.max(0, Math.round(bb.b - pad));
+                            syncRect();
+                        }
+                    } finally { autoBtn.disabled = false; }
+                });
+                card.appendChild(el('div', { class: 'btn-row' }, autoBtn, el('button', {
                     type: 'button', class: 'btn', onclick: () => { for (const k of Object.keys(nums)) nums[k].value = '0'; syncRect(); },
                 }, t('crop_reset'))));
                 const runner = A.makeRunner(body);
@@ -665,6 +993,10 @@
                             p.setCropBox(nx, ny, nw, nh);
                         }
                         await runner.applied(await doc.save());
+                        // fresh margins for the already-cropped result, so a second
+                        // Apply doesn't silently crop twice
+                        for (const k of Object.keys(nums)) nums[k].value = '0';
+                        syncRect();
                     } catch (e) { runner.error(e); }
                 })), runner.host);
             });
@@ -845,6 +1177,7 @@
                 const fmt = A.select([
                     { value: 'n', label: t('pn_fmt_n') }, { value: 'of', label: t('pn_fmt_of') },
                     { value: 'page', label: t('pn_fmt_page') }, { value: 'pageof', label: t('pn_fmt_pageof') },
+                    { value: 'roman', label: 'i, ii, iii' }, { value: 'ROMAN', label: 'I, II, III' },
                 ], 'n');
                 const start = A.input('number', { value: '1' });
                 const size = A.input('number', { value: '11', min: '5', max: '48' });
@@ -869,6 +1202,8 @@
                             const label = fmt.value === 'of' ? num + ' / ' + total
                                 : fmt.value === 'page' ? t('pn_fmt_page').replace('1', String(num))
                                 : fmt.value === 'pageof' ? t('pn_fmt_pageof').replace('1', String(num)).replace('N', String(total))
+                                : fmt.value === 'roman' ? toRoman(num)
+                                : fmt.value === 'ROMAN' ? toRoman(num).toUpperCase()
                                 : String(num);
                             const p = doc.getPage(i);
                             const tw = font.widthOfTextAtSize(label, fs);
@@ -1371,7 +1706,10 @@
                             const src = await loadLib(bytes);
                             const out = await PDFLib.PDFDocument.create();
                             for (let i = 0; i < src.getPageCount(); i++) {
-                                const { width, height } = src.getPage(i).getSize();
+                                let { width, height } = src.getPage(i).getSize();
+                                // the canvas has /Rotate baked in — swap dims, drop rotation
+                                const rot = ((src.getPage(i).getRotation().angle % 360) + 360) % 360;
+                                if (rot === 90 || rot === 270) [width, height] = [height, width];
                                 const jpg = await out.embedJpg(await A.canvasToBytes(map.get(i), 'image/jpeg', 0.88));
                                 out.addPage([width, height]).drawImage(jpg, { x: 0, y: 0, width, height });
                             }
@@ -1607,6 +1945,8 @@
                 makeCard.appendChild(drawWrap);
                 makeCard.appendChild(typeWrap);
                 makeCard.appendChild(upWrap);
+                const addDate = A.check('sg_date', false);
+                makeCard.appendChild(addDate);
                 const useBtn = el('button', { type: 'button', class: 'btn' }, t('sg_add'));
                 makeCard.appendChild(el('div', { class: 'btn-row', style: 'margin-top:.6rem' }, useBtn));
                 body.appendChild(makeCard);
@@ -1671,7 +2011,16 @@
                         const W = p.getWidth(), H = p.getHeight();
                         const w = fr.fw * W;
                         const h = w * placed.ratio;
-                        p.drawImage(img, { x: fr.fx * W, y: H - (fr.fy * H) - h, width: w, height: h });
+                        const y = H - (fr.fy * H) - h;
+                        p.drawImage(img, { x: fr.fx * W, y, width: w, height: h });
+                        if (addDate.input.checked) {
+                            const font = await doc.embedFont(PDFLib.StandardFonts.Helvetica);
+                            const ds = new Date().toLocaleDateString(PDFI18N.lang);
+                            const fs = Math.max(7, Math.min(12, h * 0.22));
+                            p.drawText(ds, { x: fr.fx * W, y: Math.max(4, y - fs - 2), size: fs, font, color: PDFLib.rgb(0.2, 0.2, 0.25) });
+                        }
+                        placed.remove();
+                        placed = null;   // the signature is baked in now — drop the overlay
                         await runner.applied(await doc.save());
                     } catch (e) { runner.error(e); }
                 })), runner.host);
@@ -1986,6 +2335,8 @@
                         const W = p.getWidth(), H = p.getHeight();
                         const w = fr.fw * W, h = w * placed.ratio;
                         p.drawImage(img, { x: fr.fx * W, y: H - fr.fy * H - h, width: w, height: h });
+                        placed.remove();
+                        placed = null;   // baked in — drop the overlay
                         await runner.applied(await doc.save());
                     } catch (e) { runner.error(e); }
                 })), runner.host);
@@ -2055,10 +2406,12 @@
                     } catch (e) { ctl = null; }
                     if (!ctl) continue;
                     controls.push({ name, ctl });
-                    const wrap = el('div', { class: 'field' }, el('label', { text: name }));
-                    if (ctl.kind === 'check') wrap.appendChild(el('label', { class: 'check' }, ctl.el, el('span', { text: name })));
-                    else wrap.appendChild(ctl.el);
-                    card.appendChild(wrap);
+                    if (ctl.kind === 'check') {
+                        card.appendChild(el('div', { class: 'field' },
+                            el('label', { class: 'check' }, ctl.el, el('span', { text: name }))));
+                    } else {
+                        card.appendChild(el('div', { class: 'field' }, el('label', { text: name }), ctl.el));
+                    }
                 }
                 const flat = A.check('ff_flatten', false);
                 card.appendChild(flat);
@@ -2100,8 +2453,9 @@
                 const q = A.input('range', { min: '20', max: '95', value: '60' });
                 const dpi = A.select([{ value: '100', label: '100' }, { value: '150', label: '150' }, { value: '200', label: '200' }], '150');
                 const gray = A.check('cp_gray', false);
+                const target = A.input('number', { min: '0.1', step: '0.1', placeholder: '—' });
                 card.appendChild(A.field(null, mode));
-                card.appendChild(el('div', { class: 'field-row' }, A.field('opt_quality', q), A.field('opt_dpi', dpi)));
+                card.appendChild(el('div', { class: 'field-row' }, A.field('opt_quality', q), A.field('opt_dpi', dpi), A.field('cp_target', target, 'cp_target_hint')));
                 card.appendChild(gray);
                 body.appendChild(card);
                 const runner = A.makeRunner(body);
@@ -2110,18 +2464,39 @@
                         runner.clear();
                         const before = A.state.bytes.length;
                         const quality = (+q.value || 60) / 100;
+                        const targetBytes = (+target.value || 0) * 1024 * 1024;
                         let bytes;
                         if (mode.getValue() === 'raster') {
                             const doc = await A.getDoc();
                             const idx = Array.from({ length: doc.numPages }, (_, i) => i);
-                            bytes = await rasterTransform(idx, +dpi.value, quality, (canvas) => {
+                            const grayFn = (canvas) => {
                                 if (gray.input.checked) pixelLoop(canvas, (d) => {
                                     for (let p = 0; p < d.length; p += 4) {
                                         const g = d[p] * 0.299 + d[p + 1] * 0.587 + d[p + 2] * 0.114;
                                         d[p] = d[p + 1] = d[p + 2] = g;
                                     }
                                 });
-                            }, (f) => runner.progress(f));
+                            };
+                            // render once, then re-encode at lower qualities until the target fits
+                            const map = new Map();
+                            let k = 0;
+                            for (const i of idx) {
+                                const { canvas } = await A.renderPage(doc, i, { dpi: +dpi.value, willRead: true });
+                                grayFn(canvas);
+                                map.set(i, canvas);
+                                runner.progress(++k / idx.length * 0.6);
+                            }
+                            const ladder = targetBytes
+                                ? [quality, ...[0.5, 0.38, 0.28, 0.2, 0.14].filter((x) => x < quality)]
+                                : [quality];
+                            bytes = null;
+                            for (let li = 0; li < ladder.length; li++) {
+                                runner.progress(0.6 + 0.4 * ((li + 1) / ladder.length));
+                                const trial = await A.replacePagesWithImages(map, ladder[li]);
+                                if (!bytes || trial.length < bytes.length) bytes = trial;
+                                if (!targetBytes || trial.length <= targetBytes) break;
+                            }
+                            if (targetBytes && bytes.length > targetBytes) A.toast(t('cp_target_miss'), 'err');
                         } else {
                             const doc = await loadLib(A.state.bytes);
                             const N = PDFLib.PDFName.of.bind(PDFLib.PDFName);
@@ -2173,6 +2548,7 @@
                                 runner.progress(++done / targets.length);
                             }
                             bytes = await doc.save({ useObjectStreams: true });
+                            if (targetBytes && bytes.length > targetBytes) A.toast(t('cp_target_miss'), 'err');
                         }
                         const after = bytes.length;
                         if (after < before) {
@@ -2253,7 +2629,7 @@
                         runner.clear();
                         const files = picker.getFiles();
                         if (!files.length) { A.toast(t('ov_file'), 'err'); return; }
-                        const ovBytes = await readBytes(files[0]);
+                        const ovBytes = await pickedPdfBytes(files[0]);
                         const ovLib = ensureContents(await loadLib(ovBytes));
                         const ovCount = ovLib.getPageCount();
                         if (mode.getValue() === 'fg') {
@@ -2350,7 +2726,7 @@
             const card = el('div', { class: 'card' });
             const pickA = A.filePicker({ multiple: false, labelKey: 'btn_choose' });
             const pickB = A.filePicker({ multiple: false, labelKey: 'btn_choose' });
-            const useWs = A.state.bytes ? A.check('merge_use_ws', true) : null;
+            const useWs = A.state.bytes ? A.check('cm_use_ws', true) : null;
             const fa = A.field(null, pickA);
             fa.insertBefore(el('label', { text: t('cm_a') }), fa.firstChild);
             if (useWs) fa.appendChild(useWs);
@@ -2364,10 +2740,10 @@
                     runner.clear();
                     let aBytes = null;
                     if (useWs && useWs.input.checked && A.state.bytes) aBytes = A.state.bytes;
-                    else if (pickA.getFiles().length) aBytes = await readBytes(pickA.getFiles()[0]);
+                    else if (pickA.getFiles().length) aBytes = await pickedPdfBytes(pickA.getFiles()[0]);
                     const bFiles = pickB.getFiles();
                     if (!aBytes || !bFiles.length) { A.toast(t('cm_b'), 'err'); return; }
-                    const bBytes = await readBytes(bFiles[0]);
+                    const bBytes = await pickedPdfBytes(bFiles[0]);
                     const [da, db] = await Promise.all([A.pdfjsDocFor(aBytes), A.pdfjsDocFor(bBytes)]);
                     const n = Math.max(da.numPages, db.numPages);
                     const frag = el('div', { class: 'card result' });
@@ -2412,6 +2788,68 @@
                     runner.host.appendChild(frag);
                 } catch (e) { runner.error(e); }
             })), runner.host);
+        },
+    });
+
+    reg({
+        id: 'bookmarks', key: 'bookmarks', cat: 'advanced', icon: '🔗',
+        build(view) {
+            A.workspaceGate(view, async (body) => {
+                body.appendChild(el('p', { class: 'hint', text: t('bm_note') }));
+                const card = el('div', { class: 'card' });
+                const list = el('div', {});
+                card.appendChild(list);
+                const rows = [];
+                function addRow(title, page) {
+                    const titleInp = A.input('text', { value: title || '' });
+                    const pageInp = A.input('number', { value: String(page || 1), min: '1', max: String(A.state.pageCount) });
+                    pageInp.style.maxWidth = '6.5rem';
+                    const row = { titleInp, pageInp };
+                    const wrap = el('div', { class: 'field-row', style: 'align-items:flex-end;margin-bottom:.6rem' },
+                        A.field('bm_title', titleInp),
+                        A.field('bm_page', pageInp),
+                        el('button', {
+                            type: 'button', class: 'icon-btn', 'aria-label': t('close'), style: 'margin-bottom:.1rem',
+                            onclick: () => { rows.splice(rows.indexOf(row), 1); wrap.remove(); refreshEmpty(); },
+                        }, '✕'));
+                    rows.push(row);
+                    list.appendChild(wrap);
+                    refreshEmpty();
+                }
+                const emptyMsg = el('p', { class: 'hint', text: t('bm_none') });
+                function refreshEmpty() { emptyMsg.style.display = rows.length ? 'none' : ''; }
+                card.appendChild(emptyMsg);
+                card.appendChild(el('div', { class: 'btn-row' }, el('button', {
+                    type: 'button', class: 'btn', onclick: () => addRow('', 1),
+                }, '+ ' + t('bm_add'))));
+                body.appendChild(card);
+                /* load existing top-level bookmarks */
+                try {
+                    const doc = await A.getDoc();
+                    const outline = await doc.getOutline();
+                    for (const item of outline || []) {
+                        try {
+                            let dest = item.dest;
+                            if (typeof dest === 'string') dest = await doc.getDestination(dest);
+                            const pi = dest ? await doc.getPageIndex(dest[0]) : 0;
+                            addRow(item.title || '', pi + 1);
+                        } catch (e) { addRow(item.title || '', 1); }
+                    }
+                } catch (e) { /* no outline */ }
+                refreshEmpty();
+                const runner = A.makeRunner(body);
+                body.insertBefore(el('div', { class: 'btn-row' }, A.runButton('btn_apply', async () => {
+                    try {
+                        runner.clear();
+                        const doc = await loadLib(A.state.bytes);
+                        const items = rows
+                            .map((r) => ({ title: r.titleInp.value.trim(), page: Math.max(0, (+r.pageInp.value || 1) - 1) }))
+                            .filter((x) => x.title);
+                        writeOutline(doc, items);
+                        await runner.applied(await doc.save());
+                    } catch (e) { runner.error(e); }
+                })), runner.host);
+            });
         },
     });
 

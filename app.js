@@ -57,7 +57,6 @@
             if (v === null || v === undefined || v === false) continue;
             if (k === 'class') n.className = v;
             else if (k === 'text') n.textContent = v;
-            else if (k === 'html') n.innerHTML = v; // only ever fed app-built markup
             else if (k.startsWith('on') && typeof v === 'function') n.addEventListener(k.slice(2), v);
             else if (k === 'dataset') for (const d of Object.keys(v)) n.dataset[d] = v[d];
             else if (v === true) n.setAttribute(k, '');
@@ -85,15 +84,21 @@
         setTimeout(() => item.remove(), 3600);
     }
 
-    /* "1-3, 5, 8-" → sorted unique 0-based indices (empty spec → all pages) */
+    /* "1-3, 5, 8-, odd" → sorted unique 0-based indices (empty spec → all) */
     function parseRanges(spec, n) {
         spec = String(spec || '').trim().toLowerCase();
         if (!spec || spec === 'all') return Array.from({ length: n }, (_, i) => i);
         const out = [];
         const seen = new Set();
+        const push = (i) => { if (i >= 0 && i < n && !seen.has(i)) { seen.add(i); out.push(i); } };
         for (const tokRaw of spec.split(',')) {
             const tok = tokRaw.trim();
             if (!tok) continue;
+            if (tok === 'all') { for (let i = 0; i < n; i++) push(i); continue; }
+            if (tok === 'odd' || tok === 'impair' || tok === 'oneven') { for (let i = 0; i < n; i += 2) push(i); continue; }
+            if (tok === 'even' || tok === 'pair') { for (let i = 1; i < n; i += 2) push(i); continue; }
+            if (tok === 'first' || tok === 'premier' || tok === 'eerste') { push(0); continue; }
+            if (tok === 'last' || tok === 'dernier' || tok === 'laatste') { push(n - 1); continue; }
             const m = tok.match(/^(\d+)?\s*-\s*(\d+)?$/);
             let a, b;
             if (m && (m[1] || m[2])) { a = m[1] ? +m[1] : 1; b = m[2] ? +m[2] : n; }
@@ -101,7 +106,7 @@
             else continue;
             if (a > b) [a, b] = [b, a];
             a = Math.max(1, a); b = Math.min(n, b);
-            for (let i = a; i <= b; i++) if (!seen.has(i - 1)) { seen.add(i - 1); out.push(i - 1); }
+            for (let i = a; i <= b; i++) push(i - 1);
         }
         return out;
     }
@@ -229,7 +234,8 @@
             .replace(/\u2026/g, '...')
             .replace(/[\u00A0\u2007\u202F]/g, ' ')
             .replace(/\t/g, '    ')
-            .replace(/[^\u0000-\u00FF\u0152\u0153\u0160\u0161\u0178\u017D\u017E\u20AC\u2022\u2020\u2021\u2030\u2122\u0192]/g, '?');
+            .replace(/[\u0000-\u001F\u007F-\u009F]/g, '')
+            .replace(/[^\u0020-\u00FF\u0152\u0153\u0160\u0161\u0178\u017D\u017E\u20AC\u2022\u2020\u2021\u2030\u2122\u0192]/g, '?');
     }
 
     function hexToRgb(hex) {
@@ -285,7 +291,9 @@
     }
 
     /* Rebuild the working copy replacing some pages with rendered canvases.
-       map: Map(pageIndex → canvas). Untouched pages are copied losslessly. */
+       map: Map(pageIndex → canvas). Untouched pages are copied losslessly.
+       Rendered canvases already have /Rotate baked in by the pdf.js viewport,
+       so rotated pages get swapped dimensions and rotation 0. */
     async function replacePagesWithImages(map, quality) {
         const src = await PDFLib.PDFDocument.load(state.bytes, { ignoreEncryption: true, throwOnInvalidObject: false, updateMetadata: false });
         const out = await PDFLib.PDFDocument.create();
@@ -298,7 +306,9 @@
             if (map.has(i)) {
                 const canvas = map.get(i);
                 const srcPage = src.getPage(i);
-                const { width, height } = srcPage.getSize();
+                let { width, height } = srcPage.getSize();
+                const rot = ((srcPage.getRotation().angle % 360) + 360) % 360;
+                if (rot === 90 || rot === 270) [width, height] = [height, width];
                 const jpg = await out.embedJpg(await canvasToBytes(canvas, 'image/jpeg', quality || 0.85));
                 const p = out.addPage([width, height]);
                 p.drawImage(jpg, { x: 0, y: 0, width, height });
@@ -323,10 +333,16 @@
     }
 
     async function countPages(bytes) {
-        const doc = await pdfjsDocFor(bytes);
-        const n = doc.numPages;
-        doc.destroy();
-        return n;
+        try {
+            const doc = await pdfjsDocFor(bytes);
+            const n = doc.numPages;
+            doc.destroy();
+            return n;
+        } catch (e) {
+            // pdf.js choked but pdf-lib produced these bytes — count there instead
+            const d = await PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true, throwOnInvalidObject: false, updateMetadata: false });
+            return d.getPageCount();
+        }
     }
 
     async function setWorkspace(bytes, opts) {
@@ -576,16 +592,30 @@
             if (o.onChange) o.onChange(files);
         }
         async function add(fileList) {
-            for (const f of fileList) files.push(f);
+            const arr = [...fileList];
+            if (o.multiple === false) {
+                // single-slot picker: the newest choice replaces the old one
+                files.length = 0;
+                if (arr.length) files.push(arr[0]);
+            } else {
+                for (const f of arr) files.push(f);
+            }
             redraw();
         }
         btn.addEventListener('click', () => inp.click());
         inp.addEventListener('change', () => { add([...inp.files]); inp.value = ''; });
+        const accepts = (f) => {
+            const a = o.accept || 'application/pdf,.pdf';
+            if (a === '*/*') return true;
+            const isPdf = /\.pdf$/i.test(f.name) || f.type === 'application/pdf';
+            const isImg = /^image\//.test(f.type) || /\.(png|jpe?g|webp|gif|bmp|svg)$/i.test(f.name);
+            return (a.includes('pdf') && isPdf) || (a.includes('image') && isImg);
+        };
         zone.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); zone.classList.add('is-over'); });
         zone.addEventListener('dragleave', () => zone.classList.remove('is-over'));
         zone.addEventListener('drop', (e) => {
             e.preventDefault(); e.stopPropagation(); zone.classList.remove('is-over');
-            add([...e.dataTransfer.files].filter((f) => !o.accept || o.accept.includes('pdf') === /pdf$/i.test(f.name) || true));
+            add([...e.dataTransfer.files].filter(accepts));
         });
         zone.getFiles = () => files.slice();
         zone.clear = () => { files.length = 0; redraw(); };
@@ -705,7 +735,11 @@
             } else {
                 const body = el('div', { class: 'tool-body' });
                 container.appendChild(body);
-                buildTool(body);
+                // builders may be async — surface their failures instead of dying silently
+                Promise.resolve(buildTool(body)).catch((err) => {
+                    console.error(err);
+                    body.appendChild(el('p', { class: 'error', text: t('err_generic', { msg: (err && err.message) || String(err) }) }));
+                });
             }
         }
         draw();
@@ -723,19 +757,55 @@
     const tools = [];   // filled by tools.js
     const CATS = ['organize', 'convert', 'security', 'edit', 'advanced'];
 
+    /* favourites (pinned tools) */
+    function getFavs() {
+        try { return JSON.parse(localStorage.getItem('pdftools:favs') || '[]'); } catch (e) { return []; }
+    }
+    function toggleFav(id) {
+        const favs = getFavs();
+        const i = favs.indexOf(id);
+        if (i >= 0) favs.splice(i, 1); else favs.push(id);
+        try { localStorage.setItem('pdftools:favs', JSON.stringify(favs)); } catch (e) { /* ignore */ }
+        buildNav();
+        if (!currentToolId()) renderHome();
+        return i < 0;
+    }
+    function favStar(toolId) {
+        const isFav = getFavs().includes(toolId);
+        const star = el('button', {
+            type: 'button', class: 'fav-star' + (isFav ? ' is-fav' : ''),
+            'aria-pressed': String(isFav), title: t('fav_toggle'), 'aria-label': t('fav_toggle'),
+        }, isFav ? '★' : '☆');
+        star.addEventListener('click', (e) => {
+            e.preventDefault(); e.stopPropagation();
+            const nowFav = toggleFav(toolId);
+            star.textContent = nowFav ? '★' : '☆';
+            star.classList.toggle('is-fav', nowFav);
+            star.setAttribute('aria-pressed', String(nowFav));
+        });
+        return star;
+    }
+
     function buildNav() {
         const nav = $('#side-nav');
         nav.textContent = '';
+        const favs = getFavs();
+        const addItem = (tool) => {
+            nav.appendChild(el('a', {
+                class: 'side-item', href: '#/tool/' + tool.id, dataset: { tool: tool.id },
+                onclick: () => { $('#side').classList.remove('is-open'); $('#nav-toggle').setAttribute('aria-expanded', 'false'); },
+            }, el('span', { class: 't-ico', 'aria-hidden': 'true' }, tool.icon), el('span', { text: t('t_' + tool.key) })));
+        };
+        const favTools = favs.map((id) => tools.find((x) => x.id === id)).filter(Boolean);
+        if (favTools.length) {
+            nav.appendChild(el('div', { class: 'side-cat', dataset: { cat: 'favs' } }, '★ ' + t('cat_favs')));
+            favTools.forEach(addItem);
+        }
         for (const cat of CATS) {
             const items = tools.filter((x) => x.cat === cat);
             if (!items.length) continue;
             nav.appendChild(el('div', { class: 'side-cat', dataset: { cat } }, t('cat_' + cat)));
-            for (const tool of items) {
-                nav.appendChild(el('a', {
-                    class: 'side-item', href: '#/tool/' + tool.id, dataset: { tool: tool.id },
-                    onclick: () => { $('#side').classList.remove('is-open'); $('#nav-toggle').setAttribute('aria-expanded', 'false'); },
-                }, el('span', { class: 't-ico', 'aria-hidden': 'true' }, tool.icon), el('span', { text: t('t_' + tool.key) })));
-            }
+            items.forEach(addItem);
         }
         applySearch();
         markCurrent();
@@ -747,6 +817,7 @@
         let any = false;
         nav.querySelectorAll('.side-item').forEach((a) => {
             const tool = tools.find((x) => x.id === a.dataset.tool);
+            if (!tool) return;
             const hay = (t('t_' + tool.key) + ' ' + t('t_' + tool.key + '_d')).toLowerCase();
             const show = !q || hay.includes(q);
             a.style.display = show ? '' : 'none';
@@ -797,17 +868,27 @@
         inp.addEventListener('change', async () => { if (inp.files[0]) await loadWorkspaceFile(inp.files[0]); });
         view.appendChild(up);
 
+        const card = (tool) => {
+            const a = el('a', { class: 'tool-card', href: '#/tool/' + tool.id },
+                el('span', { class: 't-ico', 'aria-hidden': 'true' }, tool.icon),
+                el('strong', { text: t('t_' + tool.key) }),
+                el('small', { text: t('t_' + tool.key + '_d') }));
+            a.appendChild(favStar(tool.id));
+            return a;
+        };
+        const favTools = getFavs().map((id) => tools.find((x) => x.id === id)).filter(Boolean);
+        if (favTools.length) {
+            view.appendChild(el('h2', { class: 'home-cat', text: '★ ' + t('cat_favs') }));
+            const grid = el('div', { class: 'tool-grid' });
+            favTools.forEach((tool) => grid.appendChild(card(tool)));
+            view.appendChild(grid);
+        }
         for (const cat of CATS) {
             const items = tools.filter((x) => x.cat === cat);
             if (!items.length) continue;
             view.appendChild(el('h2', { class: 'home-cat', text: t('cat_' + cat) }));
             const grid = el('div', { class: 'tool-grid' });
-            for (const tool of items) {
-                grid.appendChild(el('a', { class: 'tool-card', href: '#/tool/' + tool.id },
-                    el('span', { class: 't-ico', 'aria-hidden': 'true' }, tool.icon),
-                    el('strong', { text: t('t_' + tool.key) }),
-                    el('small', { text: t('t_' + tool.key + '_d') })));
-            }
+            items.forEach((tool) => grid.appendChild(card(tool)));
             view.appendChild(grid);
         }
     }
@@ -816,11 +897,13 @@
         const view = $('#view');
         view.textContent = '';
         view.appendChild(el('a', { class: 'back-link', href: '#/' }, '← ' + t('btn_back')));
-        view.appendChild(el('div', { class: 'tool-head' },
+        const head = el('div', { class: 'tool-head' },
             el('span', { class: 't-ico', 'aria-hidden': 'true' }, tool.icon),
             el('div', {},
                 el('h1', { text: t('t_' + tool.key) }),
-                el('p', { text: t('t_' + tool.key + '_d') }))));
+                el('p', { text: t('t_' + tool.key + '_d') })));
+        head.appendChild(favStar(tool.id));
+        view.appendChild(head);
         try {
             tool.build(view, API);
         } catch (e) {
@@ -916,6 +999,8 @@
             if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
             if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); }
             else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z'))) { e.preventDefault(); redo(); }
+            else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'o') { e.preventDefault(); $('#file-global').click(); }
+            else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && state.bytes) { e.preventDefault(); download(state.bytes, state.name, 'application/pdf'); }
         });
 
         /* global drag & drop */
@@ -938,6 +1023,7 @@
             // Drops on tool-local pickers are handled there (they stopPropagation).
             const f = [...e.dataTransfer.files].find((x) => /\.pdf$/i.test(x.name) || x.type === 'application/pdf');
             if (f) await loadWorkspaceFile(f);
+            else if (e.dataTransfer.files.length) toast(t('err_badpdf'), 'err');
         });
 
         $('#file-global').addEventListener('change', async (e) => {
