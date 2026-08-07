@@ -3880,18 +3880,6 @@
                         const doc = await loadLib(A.state.bytes);
                         const cat = doc.catalog;
 
-                        if (cJs.input.checked) {
-                            const names = dictGet(cat, 'Names');
-                            if (names && names.delete && names.get(N('JavaScript'))) { names.delete(N('JavaScript')); bump('js_tree', 1); }
-                        }
-                        if (cActions.input.checked) {
-                            if (cat.get(N('OpenAction'))) { cat.delete(N('OpenAction')); bump('openaction', 1); }
-                            if (cat.get(N('AA'))) { cat.delete(N('AA')); bump('aa', 1); }
-                        }
-                        if (cFiles.input.checked) {
-                            const names = dictGet(cat, 'Names');
-                            if (names && names.delete && names.get(N('EmbeddedFiles'))) { names.delete(N('EmbeddedFiles')); bump('embedded', 1); }
-                        }
                         if (cForms.input.checked) {
                             try {
                                 const acro = cat.lookup(N('AcroForm'), PDFLib.PDFDict);
@@ -3899,9 +3887,10 @@
                             } catch (e) { /* no form */ }
                         }
                         if (cMeta.input.checked) {
-                            if (cat.get(N('Metadata'))) { cat.delete(N('Metadata')); bump('metadata', 1); }
-                            doc.context.trailerInfo.Info = undefined;
-                            bump('metadata', 1);
+                            let meta = 0;
+                            if (cat.get(N('Metadata'))) { cat.delete(N('Metadata')); meta++; }
+                            if (doc.context.trailerInfo.Info) { doc.context.trailerInfo.Info = undefined; meta++; }
+                            bump('metadata', meta);
                         }
 
                         /* Empty every risky action dictionary in place: even an
@@ -3980,6 +3969,33 @@
                             for (const v of dict.values()) visit(v);
                         }
 
+                        /* Only now that every file specification has been found
+                           and emptied is it safe to cut the catalog entries: a
+                           specification sitting directly in the name tree would
+                           otherwise become unreachable with its payload intact. */
+                        if (cFiles.input.checked) {
+                            /* catch payload streams nothing points at any more */
+                            for (const [, obj] of doc.context.enumerateIndirectObjects()) {
+                                if (!(obj instanceof PDFLib.PDFRawStream)) continue;
+                                if (String(obj.dict.get(N('Type')) || '') !== '/EmbeddedFile') continue;
+                                if (!obj.contents || !obj.contents.length) continue;
+                                obj.contents = new Uint8Array(0);
+                                obj.dict.set(N('Length'), PDFLib.PDFNumber.of(0));
+                                obj.dict.delete(N('Filter'));
+                                obj.dict.delete(N('DecodeParms'));
+                            }
+                            const names = dictGet(cat, 'Names');
+                            if (names && names.delete && names.get(N('EmbeddedFiles'))) names.delete(N('EmbeddedFiles'));
+                        }
+                        if (cJs.input.checked) {
+                            const names = dictGet(cat, 'Names');
+                            if (names && names.delete && names.get(N('JavaScript'))) { names.delete(N('JavaScript')); bump('js_tree', 1); }
+                        }
+                        if (cActions.input.checked) {
+                            if (cat.get(N('OpenAction'))) { cat.delete(N('OpenAction')); bump('openaction', 1); }
+                            if (cat.get(N('AA'))) { cat.delete(N('AA')); bump('aa', 1); }
+                        }
+
                         /* drop annotations that carry active or external content */
                         const DROP_ANNOT = new Set(['FileAttachment', 'RichMedia', 'Movie', 'Sound', 'Screen', '3D']);
                         for (const p of doc.getPages()) {
@@ -4024,18 +4040,31 @@
                             const tmp = await A.pdfjsDocFor(bytes);
                             const src = await loadLib(bytes);
                             const out = await PDFLib.PDFDocument.create();
-                            for (let i = 0; i < tmp.numPages; i++) {
+                            // a damaged file can leave the two parsers disagreeing
+                            const nPages = Math.min(tmp.numPages, src.getPageCount());
+                            for (let i = 0; i < nPages; i++) {
                                 const { canvas } = await A.renderPage(tmp, i, { dpi: 150 });
                                 let { width, height } = src.getPage(i).getSize();
                                 const rot = ((src.getPage(i).getRotation().angle % 360) + 360) % 360;
                                 if (rot === 90 || rot === 270) [width, height] = [height, width];
                                 const jpg = await out.embedJpg(await A.canvasToBytes(canvas, 'image/jpeg', 0.88));
                                 out.addPage([width, height]).drawImage(jpg, { x: 0, y: 0, width, height });
-                                runner.progress(0.1 + 0.85 * ((i + 1) / tmp.numPages));
+                                runner.progress(0.1 + 0.85 * ((i + 1) / nPages));
                             }
                             tmp.destroy();
                             bytes = await out.save();
                             bump('raster', 1);
+                        }
+
+                        /* Check the result before it becomes the working copy —
+                           handing back a file we cannot parse ourselves would be
+                           worse than doing nothing. */
+                        let check = null;
+                        try {
+                            check = await A.analyzePdf(bytes, { deep: true });
+                        } catch (e) {
+                            runner.error(new Error(t('df_broken')));
+                            return;
                         }
 
                         await runner.applied(bytes, { downloadName: A.baseName(A.state.name) + '-defanged.pdf' });
@@ -4043,7 +4072,7 @@
                         /* change log — the evidence trail */
                         const card2 = runner.host.querySelector('.card.result');
                         if (card2) {
-                            card2.insertBefore(el('p', { class: 'hint', text: t('df_done') }), card2.children[1] || null);
+                            card2.insertBefore(el('p', { class: 'hint', text: t(log.length ? 'df_done' : 'df_done_none') }), card2.children[1] || null);
                             const list = el('div', { class: 'finding-list', style: 'margin-top:.7rem' });
                             if (!log.length) {
                                 list.appendChild(el('p', { class: 'hint', text: t('df_nothing') }));
@@ -4055,17 +4084,17 @@
                                 }
                             }
                             card2.appendChild(list);
-                            if (removedUrls.length) {
-                                card2.appendChild(el('p', { class: 'hint', style: 'margin-top:.7rem', text: t('df_urls', { n: removedUrls.length }) }));
+                            const shownUrls = [...new Set(removedUrls)];
+                            if (shownUrls.length) {
+                                card2.appendChild(el('p', { class: 'hint', style: 'margin-top:.7rem', text: t('df_urls', { n: shownUrls.length }) }));
                                 const pre = el('pre', { class: 'info-block' });
-                                pre.textContent = removedUrls.join('\n');
+                                pre.textContent = shownUrls.slice(0, 200).join('\n');
                                 card2.appendChild(pre);
                             }
 
-                            /* Verify instead of assert: re-scan the result and
-                               say plainly what, if anything, is still in there. */
-                            try {
-                                const check = await A.analyzePdf(bytes, { deep: true });
+                            /* Verify instead of assert: report what the re-scan
+                               of the finished file actually found. */
+                            {
                                 const leftovers = check.findings.filter((f) => f.sev !== 'low');
                                 const vCard = el('div', { style: 'margin-top:.8rem' });
                                 if (!leftovers.length) {
@@ -4083,7 +4112,7 @@
                                     vCard.appendChild(ll);
                                 }
                                 card2.appendChild(vCard);
-                            } catch (e) { /* verification is a bonus, never fatal */ }
+                            }
                         }
                     } catch (e) { runner.error(e); }
                 })), runner.host);
