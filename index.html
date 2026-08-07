@@ -16,7 +16,7 @@
         script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline';
         img-src 'self' data: blob:; font-src 'self'; connect-src 'self' blob:;
         manifest-src 'self'; worker-src 'self' blob:; base-uri 'none'; form-action 'none';
-        frame-src 'none'; object-src 'none'">
+        frame-src blob:; object-src 'none'">
     <meta name="referrer" content="no-referrer">
 
     <title data-i18n="app_title">PDF Studio · Local PDF toolbox</title>
@@ -46,7 +46,7 @@
 
       DEPLOY: bump this number here AND `V` in sw.js, together.
     -->
-    <link rel="stylesheet" href="style.css?v=1">
+    <link rel="stylesheet" href="style.css?v=3">
     <link rel="manifest" href="manifest.webmanifest">
     <link rel="icon" href="icon.svg">
     <link rel="apple-touch-icon" href="icon.svg">
@@ -54,9 +54,9 @@
     <script src="vendor/pdf-lib.min.js" defer></script>
     <script src="vendor/pdfjs/pdf.min.js" defer></script>
     <script src="vendor/tesseract/tesseract.min.js" defer></script>
-    <script src="i18n.js?v=1" defer></script>
-    <script src="app.js?v=1" defer></script>
-    <script src="tools.js?v=1" defer></script>
+    <script src="i18n.js?v=3" defer></script>
+    <script src="app.js?v=3" defer></script>
+    <script src="tools.js?v=3" defer></script>
 </head>
 
 <body>
@@ -148,6 +148,7 @@
         </aside>
 
         <main class="main" id="main" tabindex="-1">
+            <div id="risk-banner" class="risk-banner" role="alert" hidden></div>
             <div id="view"></div>
         </main>
 

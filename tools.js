@@ -2211,6 +2211,7 @@
                 const cLinks = A.check('sz_links', false);
                 const cAnn = A.check('sz_annots', false);
                 for (const c of [cJs, cAtt, cMeta, cLinks, cAnn]) card.appendChild(c);
+                card.appendChild(el('p', { class: 'note', text: t('sz_vs_defang') }));
                 body.appendChild(card);
                 const runner = A.makeRunner(body);
                 body.insertBefore(el('div', { class: 'btn-row' }, A.runButton('btn_apply', async () => {
@@ -2447,15 +2448,23 @@
         build(view) {
             A.workspaceGate(view, (body) => {
                 const card = el('div', { class: 'card' });
-                const mode = A.segmented([
-                    { value: 'img', label: t('cp_mode_img') }, { value: 'raster', label: t('cp_mode_raster') },
-                ], 'img');
                 const q = A.input('range', { min: '20', max: '95', value: '60' });
                 const dpi = A.select([{ value: '100', label: '100' }, { value: '150', label: '150' }, { value: '200', label: '200' }], '150');
                 const gray = A.check('cp_gray', false);
                 const target = A.input('number', { min: '0.1', step: '0.1', placeholder: '—' });
+                const dpiField = A.field('opt_dpi', dpi);
+                const targetField = A.field('cp_target', target, 'cp_target_hint');
+                // resolution and target size only mean something when rasterising
+                const mode = A.segmented([
+                    { value: 'img', label: t('cp_mode_img') }, { value: 'raster', label: t('cp_mode_raster') },
+                ], 'img', (v) => {
+                    dpiField.style.display = v === 'raster' ? '' : 'none';
+                    targetField.style.display = v === 'raster' ? '' : 'none';
+                });
+                dpiField.style.display = 'none';
+                targetField.style.display = 'none';
                 card.appendChild(A.field(null, mode));
-                card.appendChild(el('div', { class: 'field-row' }, A.field('opt_quality', q), A.field('opt_dpi', dpi), A.field('cp_target', target, 'cp_target_hint')));
+                card.appendChild(el('div', { class: 'field-row' }, A.field('opt_quality', q), dpiField, targetField));
                 card.appendChild(gray);
                 body.appendChild(card);
                 const runner = A.makeRunner(body);
@@ -2548,7 +2557,6 @@
                                 runner.progress(++done / targets.length);
                             }
                             bytes = await doc.save({ useObjectStreams: true });
-                            if (targetBytes && bytes.length > targetBytes) A.toast(t('cp_target_miss'), 'err');
                         }
                         const after = bytes.length;
                         if (after < before) {
@@ -3079,4 +3087,1009 @@
             });
         },
     });
+
+    /* ============================================== STEGANOGRAPHY & ZIP == */
+
+    const STEG_MAGIC = 'PDFSTUDIO1';
+    const STEG_KEY = 'PDFStudioHidden';
+
+    /* magic | flags | nameLen(u16) | name | dataLen(u32) | data */
+    function stegPack(name, data, encrypted) {
+        const enc = new TextEncoder();
+        const magic = enc.encode(STEG_MAGIC);
+        const nameB = enc.encode(name).slice(0, 1024);
+        const out = new Uint8Array(magic.length + 1 + 2 + nameB.length + 4 + data.length);
+        let p = 0;
+        out.set(magic, p); p += magic.length;
+        out[p++] = encrypted ? 1 : 0;
+        out[p++] = (nameB.length >> 8) & 0xFF;
+        out[p++] = nameB.length & 0xFF;
+        out.set(nameB, p); p += nameB.length;
+        out[p++] = (data.length >>> 24) & 0xFF;
+        out[p++] = (data.length >>> 16) & 0xFF;
+        out[p++] = (data.length >>> 8) & 0xFF;
+        out[p++] = data.length & 0xFF;
+        out.set(data, p);
+        return out;
+    }
+
+    function stegUnpack(buf) {
+        const enc = new TextEncoder();
+        const magic = enc.encode(STEG_MAGIC);
+        if (buf.length < magic.length + 7) return null;
+        for (let i = 0; i < magic.length; i++) if (buf[i] !== magic[i]) return null;
+        let p = magic.length;
+        const encrypted = !!(buf[p++] & 1);
+        const nl = (buf[p++] << 8) | buf[p++];
+        if (p + nl + 4 > buf.length) return null;
+        const name = new TextDecoder().decode(buf.subarray(p, p + nl));
+        p += nl;
+        const len = ((buf[p] << 24) | (buf[p + 1] << 16) | (buf[p + 2] << 8) | buf[p + 3]) >>> 0;
+        p += 4;
+        if (p + len > buf.length) return null;
+        return { name, encrypted, data: buf.subarray(p, p + len) };
+    }
+
+    /* Least-significant-bit carrier. Alpha is skipped and forced opaque so the
+       PNG keeps a plain RGB channel layout through pdf-lib's embedder. */
+    function lsbCapacity(w, h) { return Math.floor((w * h * 3) / 8); }
+
+    function lsbWrite(imgData, payload) {
+        const d = imgData.data;
+        const need = payload.length * 8;
+        if (need > Math.floor(d.length / 4) * 3) return false;
+        let bit = 0;
+        for (let i = 0; i < d.length; i += 4) {
+            d[i + 3] = 255;
+            for (let c = 0; c < 3; c++) {
+                if (bit < need) {
+                    const b = (payload[bit >> 3] >> (7 - (bit & 7))) & 1;
+                    d[i + c] = (d[i + c] & 0xFE) | b;
+                    bit++;
+                }
+            }
+        }
+        return true;
+    }
+
+    function lsbReader(px, channels) {
+        let idx = 0;
+        return function next() {
+            let cur = 0, nbits = 0;
+            while (idx < px.length) {
+                if (channels === 4 && (idx & 3) === 3) { idx++; continue; }
+                cur = (cur << 1) | (px[idx] & 1);
+                idx++;
+                if (++nbits === 8) return cur;
+            }
+            return -1;
+        };
+    }
+
+    function lsbTryRead(px, channels) {
+        const next = lsbReader(px, channels);
+        const magic = new TextEncoder().encode(STEG_MAGIC);
+        for (let i = 0; i < magic.length; i++) if (next() !== magic[i]) return null;
+        const flags = next();
+        const hi = next(), lo = next();
+        if (hi < 0 || lo < 0) return null;
+        const nl = (hi << 8) | lo;
+        if (nl > 4096) return null;
+        const nameB = new Uint8Array(nl);
+        for (let i = 0; i < nl; i++) { const b = next(); if (b < 0) return null; nameB[i] = b; }
+        const l0 = next(), l1 = next(), l2 = next(), l3 = next();
+        if (l3 < 0) return null;
+        const len = ((l0 << 24) | (l1 << 16) | (l2 << 8) | l3) >>> 0;
+        if (!len || len > 256 * 1024 * 1024) return null;
+        const data = new Uint8Array(len);
+        for (let i = 0; i < len; i++) { const b = next(); if (b < 0) return null; data[i] = b; }
+        return { name: new TextDecoder().decode(nameB), data, encrypted: !!(flags & 1) };
+    }
+
+    /* Walk every embedded image looking for an LSB payload. The image streams
+       are inflated here rather than read through pdf.js: pdf.js may hand back
+       an ImageBitmap (or a colour-managed copy), and steganography needs the
+       bytes exactly as they were written. */
+    async function stegScanImages(bytes, progress) {
+        const doc = await loadLib(bytes);
+        const N = PDFLib.PDFName.of.bind(PDFLib.PDFName);
+        const streams = [];
+        for (const [, obj] of doc.context.enumerateIndirectObjects()) {
+            if (!(obj instanceof PDFLib.PDFRawStream)) continue;
+            if (dictGet(obj.dict, 'Subtype') !== N('Image')) continue;
+            if (dictGet(obj.dict, 'Filter') !== N('FlateDecode')) continue;
+            if (obj.dict.get(N('DecodeParms'))) continue;   // a predictor would reshuffle the bytes
+            if (obj.contents.length > 40 * 1024 * 1024) continue;
+            streams.push(obj);
+        }
+        let k = 0;
+        for (const obj of streams.slice(0, 60)) {
+            if (progress) progress(++k / Math.min(streams.length, 60));
+            let px;
+            try { px = await A.inflateZlib(obj.contents); } catch (e) { continue; }
+            const found = lsbTryRead(px, 3);   // PDF samples are packed, no alpha channel
+            if (found) return found;
+        }
+        return null;
+    }
+
+    reg({
+        id: 'stego', key: 'stego', cat: 'security', icon: '🕵️',
+        build(view) {
+            A.workspaceGate(view, (body) => {
+                body.appendChild(el('p', { class: 'hint', text: t('stg_note') }));
+
+                /* ---- shared controls ---- */
+                const pw = A.input('password', { autocomplete: 'new-password' });
+                const pwField = A.field('stg_pw', pw, 'stg_pw_hint');
+
+                /* ---- hide panel ---- */
+                const textArea = el('textarea', { id: 'f-stego-text', spellcheck: 'false', placeholder: t('stg_text_ph') });
+                const textField = A.field('stg_text', textArea);
+                const fileInp = el('input', { type: 'file' });
+                const fileField = A.field('stg_file', fileInp);
+                fileField.style.display = 'none';
+                const secretType = A.segmented([
+                    { value: 'text', label: t('stg_type_text') }, { value: 'file', label: t('stg_type_file') },
+                ], 'text', (v) => {
+                    textField.style.display = v === 'text' ? '' : 'none';
+                    fileField.style.display = v === 'file' ? '' : 'none';
+                });
+                const pageInp = A.input('number', { value: '1', min: '1', max: String(A.state.pageCount) });
+                const pageField = A.field('stg_page', pageInp, 'stg_page_hint');
+                const methodHint = el('p', { class: 'hint', text: t('stg_m_lsb_hint') });
+                const method = A.segmented([
+                    { value: 'lsb', label: t('stg_m_lsb') }, { value: 'meta', label: t('stg_m_meta') },
+                ], 'lsb', (v) => {
+                    pageField.style.display = v === 'lsb' ? '' : 'none';
+                    methodHint.textContent = v === 'lsb' ? t('stg_m_lsb_hint') : t('stg_m_meta_hint');
+                });
+                const hideCard = el('div', { class: 'card' },
+                    A.field('stg_secret', secretType), textField, fileField,
+                    A.field('stg_method', method), methodHint, pageField, pwField);
+
+                /* ---- reveal panel ---- */
+                const revealCard = el('div', { class: 'card' }, el('p', { class: 'hint', text: t('stg_reveal_hint') }));
+                revealCard.style.display = 'none';
+
+                const mode = A.segmented([
+                    { value: 'hide', label: t('stg_mode_hide') }, { value: 'reveal', label: t('stg_mode_reveal') },
+                ], 'hide', (v) => {
+                    hideCard.style.display = v === 'hide' ? '' : 'none';
+                    revealCard.style.display = v === 'reveal' ? '' : 'none';
+                    if (v === 'reveal') revealCard.appendChild(pwField); else hideCard.appendChild(pwField);
+                    hideBtnRow.style.display = v === 'hide' ? '' : 'none';
+                    revealBtnRow.style.display = v === 'reveal' ? '' : 'none';
+                });
+                body.appendChild(A.field(null, mode));
+                body.appendChild(hideCard);
+                body.appendChild(revealCard);
+
+                const runner = A.makeRunner(body);
+
+                const hideBtnRow = el('div', { class: 'btn-row' }, A.runButton('stg_hide_btn', async () => {
+                    try {
+                        runner.clear();
+                        let name = 'secret.txt';
+                        let data;
+                        if (secretType.getValue() === 'text') {
+                            const txt = textArea.value;
+                            if (!txt.trim()) { A.toast(t('stg_empty'), 'err'); return; }
+                            data = new TextEncoder().encode(txt);
+                        } else {
+                            const f = fileInp.files[0];
+                            if (!f) { A.toast(t('stg_empty'), 'err'); return; }
+                            name = f.name;
+                            data = await readBytes(f);
+                        }
+                        let encrypted = false;
+                        if (pw.value) {
+                            if (!A.cryptoOk()) { A.toast(t('stg_nocrypto'), 'err'); return; }
+                            data = await A.aesEncrypt(data, pw.value);
+                            encrypted = true;
+                        }
+                        const payload = stegPack(name, data, encrypted);
+
+                        if (method.getValue() === 'meta') {
+                            const doc = await loadLib(A.state.bytes);
+                            const stream = PDFLib.PDFRawStream.of(
+                                doc.context.obj({ Type: 'EmbeddedFile', Length: payload.length }), payload);
+                            doc.catalog.set(PDFLib.PDFName.of(STEG_KEY), doc.context.register(stream));
+                            await runner.applied(await doc.save());
+                            A.toast(t('stg_hidden_ok'), 'ok');
+                            return;
+                        }
+
+                        const pageIdx = Math.max(0, Math.min(A.state.pageCount - 1, (+pageInp.value || 1) - 1));
+                        const pdfDoc = await A.getDoc();
+                        runner.progress(0.2, t('working'));
+                        let carrier = (await A.renderPage(pdfDoc, pageIdx, { dpi: 150, willRead: true })).canvas;
+                        if (lsbCapacity(carrier.width, carrier.height) < payload.length) {
+                            // capacity grows with the square of the resolution; 400 dpi keeps
+                            // the pixel buffer within reach of phones
+                            const factor = Math.sqrt(payload.length / lsbCapacity(carrier.width, carrier.height));
+                            const dpi = Math.min(400, Math.ceil(150 * factor * 1.08));
+                            carrier = (await A.renderPage(pdfDoc, pageIdx, { dpi, willRead: true })).canvas;
+                        }
+                        const maxFit = lsbCapacity(carrier.width, carrier.height);
+                        if (maxFit < payload.length) {
+                            runner.done();
+                            A.toast(t('stg_toobig', { max: A.fmtSize(maxFit) }), 'err');
+                            return;
+                        }
+                        const ctx = carrier.getContext('2d', { willReadFrequently: true });
+                        const imgData = ctx.getImageData(0, 0, carrier.width, carrier.height);
+                        lsbWrite(imgData, payload);
+                        ctx.putImageData(imgData, 0, 0);
+                        runner.progress(0.6, t('working'));
+                        // PNG keeps the exact pixels; a JPEG carrier would destroy the LSBs
+                        const pngBytes = await A.canvasToBytes(carrier, 'image/png');
+                        const src = await loadLib(A.state.bytes);
+                        const out = await PDFLib.PDFDocument.create();
+                        const n = src.getPageCount();
+                        const keep = src.getPageIndices().filter((i) => i !== pageIdx);
+                        const copied = keep.length ? await out.copyPages(src, keep) : [];
+                        const png = await out.embedPng(pngBytes);
+                        let k = 0;
+                        for (let i = 0; i < n; i++) {
+                            if (i === pageIdx) {
+                                let { width, height } = src.getPage(i).getSize();
+                                const rot = ((src.getPage(i).getRotation().angle % 360) + 360) % 360;
+                                if (rot === 90 || rot === 270) [width, height] = [height, width];
+                                out.addPage([width, height]).drawImage(png, { x: 0, y: 0, width, height });
+                            } else {
+                                out.addPage(copied[k++]);
+                            }
+                        }
+                        runner.progress(0.9, t('working'));
+                        await runner.applied(await out.save());
+                        A.toast(t('stg_hidden_ok'), 'ok');
+                    } catch (e) { runner.error(e); }
+                }));
+
+                const revealBtnRow = el('div', { class: 'btn-row', style: 'display:none' }, A.runButton('stg_reveal_btn', async () => {
+                    try {
+                        runner.clear();
+                        let found = null;
+                        /* file-structure payload first — it is instant */
+                        try {
+                            const doc = await loadLib(A.state.bytes);
+                            const ref = doc.catalog.get(PDFLib.PDFName.of(STEG_KEY));
+                            const obj = ref ? doc.context.lookup(ref) : null;
+                            if (obj && obj.contents && obj.contents.length) found = stegUnpack(obj.contents);
+                        } catch (e) { /* fall through to the image scan */ }
+                        if (!found) {
+                            runner.progress(0.05, t('working'));
+                            found = await stegScanImages(A.state.bytes, (f) => runner.progress(f));
+                        }
+                        if (!found) { runner.done(); A.toast(t('stg_none'), 'err'); return; }
+
+                        let data = found.data;
+                        if (found.encrypted) {
+                            if (!pw.value) { runner.done(); A.toast(t('stg_need_pw'), 'err'); return; }
+                            if (!A.cryptoOk()) { runner.done(); A.toast(t('stg_nocrypto'), 'err'); return; }
+                            try { data = await A.aesDecrypt(data, pw.value); }
+                            catch (e) { runner.done(); A.toast(t('stg_bad_pw'), 'err'); return; }
+                        }
+                        runner.done();
+                        runner.host.textContent = '';
+                        const card = el('div', { class: 'card result' },
+                            el('p', { class: 'res-title', text: t('stg_found', { name: found.name }) }));
+                        const isText = /\.(txt|md|csv|json|log)$/i.test(found.name) || found.name === 'secret.txt';
+                        if (isText && data.length < 200000) {
+                            const pre = el('pre', { class: 'info-block' });
+                            pre.textContent = new TextDecoder().decode(data);
+                            card.appendChild(pre);
+                        }
+                        card.appendChild(el('div', { class: 'btn-row', style: 'margin-top:.7rem' },
+                            el('button', {
+                                type: 'button', class: 'btn btn-primary',
+                                onclick: () => A.download(data, found.name, 'application/octet-stream'),
+                            }, t('btn_download') + ' — ' + found.name),
+                            el('span', { class: 'fr-size', text: A.fmtSize(data.length) })));
+                        runner.host.appendChild(card);
+                    } catch (e) { runner.error(e); }
+                }));
+
+                body.insertBefore(hideBtnRow, runner.host);
+                body.insertBefore(revealBtnRow, runner.host);
+            });
+        },
+    });
+
+    reg({
+        id: 'zip-create', key: 'zipmake', cat: 'advanced', icon: '🗄️',
+        build(view) {
+            const body = el('div', { class: 'tool-body' });
+            view.appendChild(body);
+            const card = el('div', { class: 'card' });
+            const picker = A.filePicker({ accept: '*/*', sortable: true, labelKey: 'zm_add' });
+            const zipName = A.input('text', { value: 'archive.zip' });
+            card.appendChild(picker);
+            let inclWs = null;
+            if (A.state.bytes) {
+                inclWs = A.check('zm_incl_ws', true);
+                card.appendChild(inclWs);
+            }
+            card.appendChild(A.field('zm_name', zipName));
+            body.appendChild(card);
+            const runner = A.makeRunner(body);
+            body.insertBefore(el('div', { class: 'btn-row' }, A.runButton('btn_run', async () => {
+                try {
+                    runner.clear();
+                    const entries = [];
+                    if (inclWs && inclWs.input.checked && A.state.bytes) {
+                        entries.push({ name: A.state.name, data: A.state.bytes });
+                    }
+                    for (const f of picker.getFiles()) entries.push({ name: f.name, data: await readBytes(f) });
+                    if (!entries.length) { A.toast(t('zm_need'), 'err'); return; }
+                    const raw = entries.reduce((s, e) => s + e.data.length, 0);
+                    const zip = await A.zipMake(entries, (f) => runner.progress(f));
+                    const pct = raw ? Math.max(0, Math.round((1 - zip.length / raw) * 100)) : 0;
+                    let name = zipName.value.trim() || 'archive.zip';
+                    if (!/\.zip$/i.test(name)) name += '.zip';
+                    const cardOut = runner.files([{ name, bytes: zip, mime: 'application/zip' }]);
+                    cardOut.insertBefore(el('p', { class: 'hint', text: t('zm_res', { n: entries.length, a: A.fmtSize(raw), b: A.fmtSize(zip.length), p: pct + '%' }) }), cardOut.children[1]);
+                } catch (e) { runner.error(e); }
+            })), runner.host);
+        },
+    });
+
+    reg({
+        id: 'zip-extract', key: 'zipopen', cat: 'advanced', icon: '📦',
+        build(view) {
+            const body = el('div', { class: 'tool-body' });
+            view.appendChild(body);
+            const card = el('div', { class: 'card' });
+            const picker = A.filePicker({ accept: '*/*', multiple: false, labelKey: 'btn_choose' });
+            card.appendChild(A.field('zo_file', picker));
+            body.appendChild(card);
+            const runner = A.makeRunner(body);
+            body.insertBefore(el('div', { class: 'btn-row' }, A.runButton('btn_run', async () => {
+                try {
+                    runner.clear();
+                    const files = picker.getFiles();
+                    if (!files.length) { A.toast(t('zo_need'), 'err'); return; }
+                    const entries = await A.zipRead(await readBytes(files[0]));
+                    const good = entries.filter((e) => e.data);
+                    runner.done();
+                    runner.host.textContent = '';
+                    if (!entries.length) { A.toast(t('zo_empty'), 'err'); return; }
+                    const out = el('div', { class: 'card result' },
+                        el('p', { class: 'res-title', text: t('zo_entries', { n: entries.length }) }));
+                    const items = el('div', { class: 'res-items' });
+                    for (const e of entries) {
+                        if (e.error) {
+                            items.appendChild(el('div', { class: 'res-item' },
+                                el('span', { class: 'fr-name', text: e.name }),
+                                el('span', { class: 'error', text: e.error === 'encrypted' ? t('zo_err_enc') : e.error })));
+                            continue;
+                        }
+                        const row = el('div', { class: 'res-item' },
+                            el('button', {
+                                type: 'button', class: 'btn',
+                                onclick: () => A.download(e.data, e.name.split('/').pop(), 'application/octet-stream'),
+                            }, '⭳ ' + e.name),
+                            el('span', { class: 'fr-size', text: A.fmtSize(e.data.length) }));
+                        if (/\.pdf$/i.test(e.name)) {
+                            row.appendChild(el('button', {
+                                type: 'button', class: 'btn',
+                                onclick: async () => {
+                                    const f = new File([e.data], e.name.split('/').pop(), { type: 'application/pdf' });
+                                    await A.loadWorkspaceFile(f);
+                                },
+                            }, t('zo_open_ws')));
+                        }
+                        items.appendChild(row);
+                    }
+                    out.appendChild(items);
+                    if (good.length > 1) {
+                        out.appendChild(el('div', { class: 'btn-row', style: 'margin-top:.7rem' },
+                            el('button', {
+                                type: 'button', class: 'btn',
+                                onclick: () => good.forEach((e, i) => setTimeout(() => A.download(e.data, e.name.split('/').pop(), 'application/octet-stream'), i * 250)),
+                            }, t('zo_save_all'))));
+                    }
+                    runner.host.appendChild(out);
+                } catch (e) { runner.error(e); }
+            })), runner.host);
+        },
+    });
+
+    reg({
+        id: 'toc', key: 'toc', cat: 'organize', icon: '🧾',
+        build(view) {
+            A.workspaceGate(view, (body) => {
+                body.appendChild(el('p', { class: 'hint', text: t('toc_note') }));
+                const card = el('div', { class: 'card' });
+                const title = A.input('text', { value: t('toc_default_title') });
+                const size = A.input('number', { value: '11', min: '7', max: '20' });
+                card.appendChild(el('div', { class: 'field-row' }, A.field('toc_title', title), A.field('opt_fontsize', size)));
+                body.appendChild(card);
+                const runner = A.makeRunner(body);
+                body.insertBefore(el('div', { class: 'btn-row' }, A.runButton('btn_apply', async () => {
+                    try {
+                        runner.clear();
+                        const doc = await A.getDoc();
+                        const outline = await doc.getOutline();
+                        if (!outline || !outline.length) { A.toast(t('toc_none'), 'err'); return; }
+                        const items = [];
+                        const walk = async (list, depth) => {
+                            for (const it of list) {
+                                let dest = it.dest;
+                                try {
+                                    if (typeof dest === 'string') dest = await doc.getDestination(dest);
+                                    const pi = dest ? await doc.getPageIndex(dest[0]) : 0;
+                                    items.push({ title: it.title || '', page: pi, depth });
+                                } catch (e) { items.push({ title: it.title || '', page: 0, depth }); }
+                                if (it.items && it.items.length && depth < 2) await walk(it.items, depth + 1);
+                            }
+                        };
+                        await walk(outline, 0);
+                        if (!items.length) { A.toast(t('toc_none'), 'err'); return; }
+
+                        const src = await loadLib(A.state.bytes);
+                        const first = src.getPage(0).getSize();
+                        const fs = +size.value || 11;
+                        const lh = fs * 1.9;
+                        const margin = 56;
+                        const usable = first.height - margin * 2 - fs * 3;
+                        const perPage = Math.max(1, Math.floor(usable / lh));
+                        const tocPages = Math.ceil(items.length / perPage);
+
+                        const out = await PDFLib.PDFDocument.create();
+                        const font = await out.embedFont(PDFLib.StandardFonts.Helvetica);
+                        const bold = await out.embedFont(PDFLib.StandardFonts.HelveticaBold);
+                        for (let i = 0; i < tocPages; i++) out.addPage([first.width, first.height]);
+                        (await out.copyPages(src, src.getPageIndices())).forEach((p) => out.addPage(p));
+
+                        let idx = 0;
+                        for (let tp = 0; tp < tocPages; tp++) {
+                            const page = out.getPage(tp);
+                            let y = first.height - margin;
+                            if (tp === 0) {
+                                page.drawText(A.winAnsiSafe(title.value || t('toc_default_title')), { x: margin, y: y - fs * 1.6, size: fs * 1.6, font: bold });
+                                y -= fs * 3;
+                            }
+                            for (let k = 0; k < perPage && idx < items.length; k++, idx++) {
+                                const it = items[idx];
+                                const target = it.page + tocPages;
+                                const label = A.winAnsiSafe('  '.repeat(it.depth) + it.title).slice(0, 110);
+                                const num = String(target + 1);
+                                const numW = font.widthOfTextAtSize(num, fs);
+                                const textY = y - fs;
+                                page.drawText(label, { x: margin, y: textY, size: fs, font, color: PDFLib.rgb(0.12, 0.12, 0.16) });
+                                page.drawText(num, { x: first.width - margin - numW, y: textY, size: fs, font, color: PDFLib.rgb(0.12, 0.12, 0.16) });
+                                const labelW = font.widthOfTextAtSize(label, fs);
+                                const dotsFrom = margin + labelW + 6;
+                                const dotsTo = first.width - margin - numW - 6;
+                                if (dotsTo > dotsFrom) {
+                                    page.drawLine({
+                                        start: { x: dotsFrom, y: textY + fs * 0.28 }, end: { x: dotsTo, y: textY + fs * 0.28 },
+                                        thickness: 0.4, color: PDFLib.rgb(0.72, 0.72, 0.76), dashArray: [1, 2],
+                                    });
+                                }
+                                const annots = page.node.lookupMaybe(PDFLib.PDFName.of('Annots'), PDFLib.PDFArray) || out.context.obj([]);
+                                annots.push(out.context.register(out.context.obj({
+                                    Type: 'Annot', Subtype: 'Link',
+                                    Rect: [margin, textY - 2, first.width - margin, textY + fs],
+                                    Border: [0, 0, 0],
+                                    Dest: [out.getPage(target).ref, PDFLib.PDFName.of('Fit')],
+                                })));
+                                page.node.set(PDFLib.PDFName.of('Annots'), annots);
+                                y -= lh;
+                            }
+                            runner.progress((tp + 1) / tocPages);
+                        }
+                        writeOutline(out, items.map((it) => ({ title: it.title, page: it.page + tocPages })));
+                        await runner.applied(await out.save());
+                    } catch (e) { runner.error(e); }
+                })), runner.host);
+            });
+        },
+    });
+
+    reg({
+        id: 'print', key: 'print', cat: 'advanced', icon: '🖨️',
+        build(view) {
+            A.workspaceGate(view, (body) => {
+                const card = el('div', { class: 'card' },
+                    el('p', { class: 'hint', text: t('prn_note') }));
+                const openPrint = (dialog) => {
+                    const blob = new Blob([A.state.bytes.slice()], { type: 'application/pdf' });
+                    const url = URL.createObjectURL(blob);
+                    if (!dialog) {
+                        window.open(url, '_blank', 'noopener');
+                        setTimeout(() => URL.revokeObjectURL(url), 60000);
+                        return;
+                    }
+                    const frame = el('iframe', { src: url, title: 'print', style: 'position:fixed;right:0;bottom:0;width:1px;height:1px;border:0;opacity:0' });
+                    frame.addEventListener('load', () => {
+                        try { frame.contentWindow.focus(); frame.contentWindow.print(); }
+                        catch (e) { window.open(url, '_blank', 'noopener'); }
+                    });
+                    document.body.appendChild(frame);
+                    setTimeout(() => { frame.remove(); URL.revokeObjectURL(url); }, 120000);
+                };
+                card.appendChild(el('div', { class: 'btn-row' },
+                    el('button', { type: 'button', class: 'btn btn-primary', onclick: () => openPrint(true) }, '🖨️ ' + t('prn_btn')),
+                    el('button', { type: 'button', class: 'btn', onclick: () => openPrint(false) }, t('prn_newtab'))));
+                body.appendChild(card);
+            });
+        },
+    });
+    /* ==================================== SECURITY TRIAGE / IR TOOLING == */
+
+    const SEV_LABEL = { high: 'sev_high', medium: 'sev_medium', low: 'sev_low', info: 'sev_low' };
+
+    function sevChip(sev) {
+        return el('span', { class: 'sev sev-' + sev, text: t(SEV_LABEL[sev] || 'sev_low') });
+    }
+
+    /* Human-readable report — deliberately plain text so it can be pasted
+       into a ticket. Every URL is defanged. */
+    function reportText(rep, name) {
+        const L = [];
+        L.push('PDF triage report');
+        L.push('=================');
+        L.push('file        : ' + name);
+        L.push('size        : ' + A.fmtSize(rep.size));
+        L.push('sha256      : ' + (rep.sha256 || 'n/a'));
+        L.push('pdf version : ' + (rep.version || '?'));
+        L.push('pages       : ' + rep.pageCount);
+        L.push('objects     : ' + (rep.objects || 0));
+        L.push('encrypted   : ' + (rep.encrypted ? 'yes' : 'no'));
+        L.push('verdict     : ' + rep.verdict.toUpperCase());
+        L.push('');
+        L.push('Findings');
+        L.push('--------');
+        if (!rep.findings.length) L.push('(none)');
+        for (const f of rep.findings) {
+            L.push('[' + f.sev.toUpperCase() + '] ' + t('f_' + f.key) + ' x' + f.count);
+            for (const it of f.items) L.push('        ' + it);
+        }
+        L.push('');
+        L.push('URLs (defanged)');
+        L.push('---------------');
+        if (!rep.uris.length) L.push('(none)');
+        for (const u of rep.uris) {
+            L.push('[' + u.sev.toUpperCase() + '] ' + u.defanged + (u.why.length ? '   (' + u.why.join(', ') + ')' : ''));
+        }
+        L.push('');
+        L.push('Embedded files');
+        L.push('--------------');
+        if (!rep.embedded.length) L.push('(none)');
+        for (const f of rep.embedded) L.push((f.risky ? '[HIGH] ' : '[MED ] ') + f.name + (f.size ? '  ' + A.fmtSize(f.size) : ''));
+        L.push('');
+        L.push('Script indicators');
+        L.push('-----------------');
+        if (!rep.jsIocs || !rep.jsIocs.length) L.push('(none)');
+        for (const i of (rep.jsIocs || [])) L.push('[' + i.kind.toUpperCase() + '] ' + i.token + (i.cve ? '  ' + i.cve : ''));
+        L.push('');
+        L.push('Raw keyword census (pdfid style)');
+        L.push('--------------------------------');
+        const kw = Object.keys(rep.raw);
+        if (!kw.length) L.push('(none)');
+        for (const k of kw) L.push('  ' + k.padEnd(16) + rep.raw[k]);
+        if (rep.scripts.length) {
+            L.push('');
+            L.push('Scripts');
+            L.push('-------');
+            rep.scripts.forEach((s, i) => {
+                L.push('--- script ' + (i + 1) + ' (' + s.name + ') ---');
+                L.push(s.code.slice(0, 20000));
+            });
+        }
+        return L.join('\n') + '\n';
+    }
+
+    reg({
+        id: 'threat-scan', key: 'threat', cat: 'security', icon: '🔬',
+        build(view) {
+            A.workspaceGate(view, (body) => {
+                body.appendChild(el('p', { class: 'hint', text: t('ts_note') }));
+                const card = el('div', { class: 'card' });
+                const deep = A.check('ts_pagetext', true);
+                card.appendChild(deep);
+                body.appendChild(card);
+                const runner = A.makeRunner(body);
+
+                body.insertBefore(el('div', { class: 'btn-row' }, A.runButton('ts_run', async () => {
+                    try {
+                        runner.clear();
+                        runner.progress(0.05, t('working'));
+                        const rep = await A.analyzePdf(A.state.bytes, {
+                            deep: true,
+                            pageText: deep.input.checked,
+                            onProgress: (f) => runner.progress(0.1 + f * 0.85),
+                        });
+                        runner.done();
+                        runner.host.textContent = '';
+                        const out = el('div');
+
+                        /* verdict */
+                        const vIco = rep.verdict === 'danger' ? '⚠️' : rep.verdict === 'caution' ? 'ℹ️' : '✅';
+                        out.appendChild(el('div', { class: 'verdict v-' + rep.verdict },
+                            el('span', { class: 'v-ico', 'aria-hidden': 'true' }, vIco),
+                            el('div', {},
+                                el('strong', { text: t('ts_verdict_' + rep.verdict) }),
+                                el('small', { text: t('ts_verdict_' + rep.verdict + '_d') }))));
+
+                        /* fingerprint */
+                        const meta = el('table', { class: 'kv' });
+                        const row = (k, v) => meta.appendChild(el('tr', {}, el('td', { text: k }), el('td', { text: v })));
+                        row(t('info_size'), A.fmtSize(rep.size));
+                        row('SHA-256', rep.sha256 || '—');
+                        row(t('info_version'), rep.version || '—');
+                        row(t('info_pages'), String(rep.pageCount));
+                        row(t('ts_objects'), String(rep.objects || 0));
+                        row(t('info_enc'), rep.encrypted ? t('yes') : t('no'));
+                        out.appendChild(el('div', { class: 'card' }, el('h2', { text: t('ts_fingerprint') }), meta));
+
+                        /* be honest when the optional text sweep did not finish */
+                        if (deep.input.checked && rep.textScan !== 'done') {
+                            out.appendChild(el('div', { class: 'card' },
+                                el('p', { class: 'note', text: t('ts_text_incomplete') })));
+                        }
+
+                        /* findings */
+                        const fCard = el('div', { class: 'card' }, el('h2', { text: t('ts_findings') }));
+                        if (!rep.findings.length) {
+                            fCard.appendChild(el('p', { class: 'hint', text: t('ts_no_findings') }));
+                        } else {
+                            const list = el('div', { class: 'finding-list' });
+                            for (const f of rep.findings) {
+                                const node = el('div', { class: 'finding' },
+                                    sevChip(f.sev),
+                                    el('div', { class: 'f-main' },
+                                        el('strong', { text: t('f_' + f.key) + (f.count > 1 ? '  ×' + f.count : '') }),
+                                        el('small', { text: t('f_' + f.key + '_d') })));
+                                if (f.items.length) {
+                                    node.appendChild(el('div', { class: 'f-items', text: f.items.join('\n') }));
+                                }
+                                list.appendChild(node);
+                            }
+                            fCard.appendChild(list);
+                        }
+                        out.appendChild(fCard);
+
+                        /* URLs */
+                        if (rep.uris.length) {
+                            const uCard = el('div', { class: 'card' },
+                                el('h2', { text: t('ts_urls', { n: rep.uris.length }) }),
+                                el('p', { class: 'hint', text: t('ts_urls_note') }));
+                            const box = el('div');
+                            for (const u of rep.uris.slice(0, 300)) {
+                                box.appendChild(el('div', { class: 'url-row' },
+                                    sevChip(u.sev),
+                                    el('code', { text: u.defanged }),
+                                    el('span', { class: 'url-why', text: u.where.map((w) => t('ts_where_' + w)).join(', ') + (u.why.length ? ' · ' + u.why.map((w) => t('ts_why_' + w)).join(', ') : '') })));
+                            }
+                            uCard.appendChild(box);
+                            uCard.appendChild(el('div', { class: 'btn-row', style: 'margin-top:.7rem' },
+                                el('button', {
+                                    type: 'button', class: 'btn',
+                                    onclick: () => navigator.clipboard && navigator.clipboard.writeText(rep.uris.map((u) => u.defanged).join('\n')).then(() => A.toast(t('toast_copied'), 'ok')),
+                                }, t('ts_copy_urls'))));
+                            out.appendChild(uCard);
+                        }
+
+                        /* embedded files */
+                        if (rep.embedded.length) {
+                            const eCard = el('div', { class: 'card' }, el('h2', { text: t('ts_embedded') }));
+                            for (const f of rep.embedded) {
+                                eCard.appendChild(el('div', { class: 'url-row' },
+                                    sevChip(f.risky ? 'high' : 'medium'),
+                                    el('code', { text: f.name }),
+                                    el('span', { class: 'url-why', text: f.size ? A.fmtSize(f.size) : '' })));
+                            }
+                            eCard.appendChild(el('p', { class: 'hint', text: t('ts_embedded_note') }));
+                            out.appendChild(eCard);
+                        }
+
+                        /* script indicators + code */
+                        if (rep.scripts.length) {
+                            const sCard = el('div', { class: 'card' }, el('h2', { text: t('ts_scripts', { n: rep.scripts.length }) }));
+                            if (rep.jsIocs && rep.jsIocs.length) {
+                                const iocBox = el('div', { class: 'finding-list', style: 'margin-bottom:.7rem' });
+                                for (const i of rep.jsIocs) {
+                                    iocBox.appendChild(el('div', { class: 'finding' },
+                                        sevChip(i.kind === 'exploit' ? 'high' : 'medium'),
+                                        el('div', { class: 'f-main' },
+                                            el('strong', { class: 'ioc-token', text: i.token + (i.cve ? '  ' + i.cve : '') }),
+                                            el('small', { text: t(i.kind === 'exploit' ? 'ts_ioc_exploit' : 'ts_ioc_suspicious') }))));
+                                }
+                                sCard.appendChild(iocBox);
+                            }
+                            sCard.appendChild(el('p', { class: 'hint', text: t('ts_scripts_note') }));
+                            for (const s of rep.scripts.slice(0, 10)) {
+                                const pre = el('pre', { class: 'info-block' });
+                                pre.textContent = s.code.slice(0, 20000);
+                                sCard.appendChild(pre);
+                            }
+                            out.appendChild(sCard);
+                        }
+
+                        /* raw census */
+                        const kws = Object.keys(rep.raw);
+                        if (kws.length) {
+                            const rCard = el('div', { class: 'card' },
+                                el('h2', { text: t('ts_raw') }),
+                                el('p', { class: 'hint', text: t('ts_raw_note') }));
+                            const tbl = el('table', { class: 'kv' });
+                            for (const k of kws) tbl.appendChild(el('tr', {}, el('td', { text: k }), el('td', { text: String(rep.raw[k]) })));
+                            rCard.appendChild(tbl);
+                            out.appendChild(rCard);
+                        }
+
+                        /* exports + next step */
+                        const base = A.baseName(A.state.name);
+                        out.appendChild(el('div', { class: 'card' },
+                            el('h2', { text: t('ts_export') }),
+                            el('div', { class: 'btn-row' },
+                                el('button', {
+                                    type: 'button', class: 'btn btn-primary',
+                                    onclick: () => A.download(new TextEncoder().encode(reportText(rep, A.state.name)), base + '-triage.txt', 'text/plain'),
+                                }, '⭳ ' + t('ts_export_txt')),
+                                el('button', {
+                                    type: 'button', class: 'btn',
+                                    onclick: () => A.download(new TextEncoder().encode(JSON.stringify({ file: A.state.name, generated: new Date().toISOString(), report: rep }, null, 2)), base + '-triage.json', 'application/json'),
+                                }, '⭳ ' + t('ts_export_json')),
+                                (rep.verdict !== 'clean'
+                                    ? el('a', { class: 'btn', href: '#/tool/defang' }, '🛡️ ' + t('rb_defang'))
+                                    : null))));
+
+                        runner.host.appendChild(out);
+                    } catch (e) { runner.error(e); }
+                })), runner.host);
+            });
+        },
+    });
+
+    reg({
+        id: 'defang', key: 'defang', cat: 'security', icon: '🛡️',
+        build(view) {
+            A.workspaceGate(view, (body) => {
+                body.appendChild(el('p', { class: 'hint', text: t('df_note') }));
+                const card = el('div', { class: 'card' });
+                const cJs = A.check('df_js', true);
+                const cActions = A.check('df_actions', true);
+                const cLinks = A.check('df_links', true);
+                const cFiles = A.check('df_files', true);
+                const cMedia = A.check('df_media', true);
+                const cForms = A.check('df_forms', false);
+                const cMeta = A.check('df_meta', false);
+                const cRaster = A.check('df_raster', false);
+                for (const c of [cJs, cActions, cLinks, cFiles, cMedia, cForms, cMeta, cRaster]) card.appendChild(c);
+                card.appendChild(el('p', { class: 'hint', text: t('df_raster_note') }));
+                body.appendChild(card);
+                const runner = A.makeRunner(body);
+
+                body.insertBefore(el('div', { class: 'btn-row' }, A.runButton('df_run', async () => {
+                    try {
+                        runner.clear();
+                        const N = PDFLib.PDFName.of.bind(PDFLib.PDFName);
+                        const log = [];
+                        const bump = (key, n) => {
+                            if (!n) return;
+                            const e = log.find((x) => x.key === key);
+                            if (e) e.n += n; else log.push({ key, n });
+                        };
+                        const removedUrls = [];
+
+                        const doc = await loadLib(A.state.bytes);
+                        const cat = doc.catalog;
+
+                        if (cJs.input.checked) {
+                            const names = dictGet(cat, 'Names');
+                            if (names && names.delete && names.get(N('JavaScript'))) { names.delete(N('JavaScript')); bump('js_tree', 1); }
+                        }
+                        if (cActions.input.checked) {
+                            if (cat.get(N('OpenAction'))) { cat.delete(N('OpenAction')); bump('openaction', 1); }
+                            if (cat.get(N('AA'))) { cat.delete(N('AA')); bump('aa', 1); }
+                        }
+                        if (cFiles.input.checked) {
+                            const names = dictGet(cat, 'Names');
+                            if (names && names.delete && names.get(N('EmbeddedFiles'))) { names.delete(N('EmbeddedFiles')); bump('embedded', 1); }
+                        }
+                        if (cForms.input.checked) {
+                            try {
+                                const acro = cat.lookup(N('AcroForm'), PDFLib.PDFDict);
+                                if (acro && acro.get(N('XFA'))) { acro.delete(N('XFA')); bump('xfa', 1); }
+                            } catch (e) { /* no form */ }
+                        }
+                        if (cMeta.input.checked) {
+                            if (cat.get(N('Metadata'))) { cat.delete(N('Metadata')); bump('metadata', 1); }
+                            doc.context.trailerInfo.Info = undefined;
+                            bump('metadata', 1);
+                        }
+
+                        /* Empty every risky action dictionary in place: even an
+                           action reached through an odd reference is then dead.
+                           The walk descends into nested direct dictionaries too,
+                           because writers normally inline the /A action inside
+                           the annotation instead of making it its own object. */
+                        const KILL = { JavaScript: 'js', Launch: 'launch', SubmitForm: 'submit', ImportData: 'submit', GoToR: 'remote', RichMediaExecute: 'media', Movie: 'media', Sound: 'media', Rendition: 'media' };
+                        const seenObj = new Set();
+                        const queue = [];
+                        const visit = (v) => {
+                            if (!v || seenObj.has(v)) return;
+                            if (v instanceof PDFLib.PDFDict || v instanceof PDFLib.PDFArray) { seenObj.add(v); queue.push(v); }
+                        };
+                        for (const [, obj] of doc.context.enumerateIndirectObjects()) {
+                            if (obj instanceof PDFLib.PDFDict) visit(obj);
+                            else if (obj instanceof PDFLib.PDFRawStream) visit(obj.dict);
+                        }
+                        visit(cat);
+
+                        while (queue.length) {
+                            const node = queue.pop();
+                            if (node instanceof PDFLib.PDFArray) {
+                                for (let i = 0; i < node.size(); i++) visit(node.get(i));
+                                continue;
+                            }
+                            const dict = node;
+
+                            const sVal = dict.get(N('S'));
+                            const kind = sVal ? String(sVal).replace('/', '') : null;
+
+                            if (kind === 'URI' && cLinks.input.checked) {
+                                const uri = dict.lookup(N('URI'));
+                                const text = uri && (uri.asString ? uri.asString() : '');
+                                if (text) removedUrls.push(A.defangUrl(text));
+                                ['S', 'URI', 'IsMap', 'Next'].forEach((k) => dict.delete(N(k)));
+                                bump('links', 1);
+                            } else if (kind && KILL[kind]) {
+                                const group = KILL[kind];
+                                const enabled = (group === 'js' && cJs.input.checked)
+                                    || (group !== 'js' && group !== 'media' && cActions.input.checked)
+                                    || (group === 'media' && cMedia.input.checked);
+                                if (enabled) {
+                                    ['S', 'JS', 'F', 'D', 'Win', 'Mac', 'Unix', 'URI', 'Next', 'R', 'C', 'OP'].forEach((k) => dict.delete(N(k)));
+                                    bump(group, 1);
+                                }
+                            }
+
+                            if (cActions.input.checked && dict.get(N('AA'))) { dict.delete(N('AA')); bump('aa', 1); }
+                            if (cJs.input.checked && dict.get(N('JS')) && !kind) { dict.delete(N('JS')); bump('js', 1); }
+                            if (cFiles.input.checked && String(dict.get(N('Type')) || '') === '/Filespec' && dict.get(N('EF'))) {
+                                /* Unlinking the file specification leaves the
+                                   payload stream sitting in the bytes. Empty it
+                                   too, otherwise a "cleaned" document still
+                                   carries the attachment someone might extract. */
+                                try {
+                                    const ef = dict.lookup(N('EF'), PDFLib.PDFDict);
+                                    if (ef) {
+                                        for (const k of ef.keys()) {
+                                            const st = ef.lookup(k);
+                                            if (st && st.contents) {
+                                                st.contents = new Uint8Array(0);
+                                                if (st.dict && st.dict.set) {
+                                                    st.dict.set(N('Length'), PDFLib.PDFNumber.of(0));
+                                                    st.dict.delete(N('Filter'));
+                                                    st.dict.delete(N('DecodeParms'));
+                                                }
+                                            }
+                                        }
+                                    }
+                                } catch (e) { /* payload not reachable */ }
+                                ['EF', 'F', 'UF', 'DOS', 'Mac', 'Unix', 'RF'].forEach((k) => dict.delete(N(k)));
+                                bump('embedded', 1);
+                            }
+
+                            for (const v of dict.values()) visit(v);
+                        }
+
+                        /* drop annotations that carry active or external content */
+                        const DROP_ANNOT = new Set(['FileAttachment', 'RichMedia', 'Movie', 'Sound', 'Screen', '3D']);
+                        for (const p of doc.getPages()) {
+                            let arr;
+                            try { arr = p.node.lookup(N('Annots'), PDFLib.PDFArray); } catch (e) { arr = null; }
+                            if (!arr) continue;
+                            const kept = [];
+                            let dropped = 0;
+                            for (let i = 0; i < arr.size(); i++) {
+                                let a = null;
+                                try { a = arr.lookup(i, PDFLib.PDFDict); } catch (e) { a = null; }
+                                const sub = a ? String(a.get(N('Subtype')) || '').replace('/', '') : '';
+                                const kill = (cMedia.input.checked && DROP_ANNOT.has(sub) && sub !== 'FileAttachment')
+                                    || (cFiles.input.checked && sub === 'FileAttachment');
+                                if (a && kill) {
+                                    /* Unlinking it from the page is enough for a
+                                       viewer, but the object itself stays in the
+                                       bytes and any scanner would still flag it.
+                                       Blank it so a re-scan agrees it is gone. */
+                                    for (const k of a.keys()) a.delete(k);
+                                    dropped++;
+                                    continue;
+                                }
+                                if (a && cActions.input.checked && a.get(N('AA'))) a.delete(N('AA'));
+                                kept.push(arr.get(i));
+                            }
+                            if (dropped) {
+                                bump('annots', dropped);
+                                if (kept.length) p.node.set(N('Annots'), doc.context.obj(kept));
+                                else p.node.delete(N('Annots'));
+                            }
+                        }
+
+                        if (cForms.input.checked) {
+                            try { doc.getForm().flatten(); bump('forms', 1); } catch (e) { /* nothing to flatten */ }
+                        }
+
+                        let bytes = await doc.save({ useObjectStreams: false });
+
+                        if (cRaster.input.checked) {
+                            runner.progress(0.1, t('working'));
+                            const tmp = await A.pdfjsDocFor(bytes);
+                            const src = await loadLib(bytes);
+                            const out = await PDFLib.PDFDocument.create();
+                            for (let i = 0; i < tmp.numPages; i++) {
+                                const { canvas } = await A.renderPage(tmp, i, { dpi: 150 });
+                                let { width, height } = src.getPage(i).getSize();
+                                const rot = ((src.getPage(i).getRotation().angle % 360) + 360) % 360;
+                                if (rot === 90 || rot === 270) [width, height] = [height, width];
+                                const jpg = await out.embedJpg(await A.canvasToBytes(canvas, 'image/jpeg', 0.88));
+                                out.addPage([width, height]).drawImage(jpg, { x: 0, y: 0, width, height });
+                                runner.progress(0.1 + 0.85 * ((i + 1) / tmp.numPages));
+                            }
+                            tmp.destroy();
+                            bytes = await out.save();
+                            bump('raster', 1);
+                        }
+
+                        await runner.applied(bytes, { downloadName: A.baseName(A.state.name) + '-defanged.pdf' });
+
+                        /* change log — the evidence trail */
+                        const card2 = runner.host.querySelector('.card.result');
+                        if (card2) {
+                            card2.insertBefore(el('p', { class: 'hint', text: t('df_done') }), card2.children[1] || null);
+                            const list = el('div', { class: 'finding-list', style: 'margin-top:.7rem' });
+                            if (!log.length) {
+                                list.appendChild(el('p', { class: 'hint', text: t('df_nothing') }));
+                            } else {
+                                for (const e of log) {
+                                    list.appendChild(el('div', { class: 'finding' },
+                                        el('span', { class: 'sev sev-low', text: '−' + e.n }),
+                                        el('div', { class: 'f-main' }, el('strong', { text: t('df_l_' + e.key) }))));
+                                }
+                            }
+                            card2.appendChild(list);
+                            if (removedUrls.length) {
+                                card2.appendChild(el('p', { class: 'hint', style: 'margin-top:.7rem', text: t('df_urls', { n: removedUrls.length }) }));
+                                const pre = el('pre', { class: 'info-block' });
+                                pre.textContent = removedUrls.join('\n');
+                                card2.appendChild(pre);
+                            }
+
+                            /* Verify instead of assert: re-scan the result and
+                               say plainly what, if anything, is still in there. */
+                            try {
+                                const check = await A.analyzePdf(bytes, { deep: true });
+                                const leftovers = check.findings.filter((f) => f.sev !== 'low');
+                                const vCard = el('div', { style: 'margin-top:.8rem' });
+                                if (!leftovers.length) {
+                                    vCard.appendChild(el('p', { class: 'note', text: t('df_verified') }));
+                                } else {
+                                    vCard.appendChild(el('p', { class: 'note', text: t('df_verify_left', { n: leftovers.length }) }));
+                                    const ll = el('div', { class: 'finding-list' });
+                                    for (const f of leftovers) {
+                                        ll.appendChild(el('div', { class: 'finding' },
+                                            sevChip(f.sev),
+                                            el('div', { class: 'f-main' },
+                                                el('strong', { text: t('f_' + f.key) }),
+                                                el('small', { text: t('f_' + f.key + '_d') }))));
+                                    }
+                                    vCard.appendChild(ll);
+                                }
+                                card2.appendChild(vCard);
+                            } catch (e) { /* verification is a bonus, never fatal */ }
+                        }
+                    } catch (e) { runner.error(e); }
+                })), runner.host);
+            });
+        },
+    });
 })();
+
+

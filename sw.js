@@ -9,7 +9,7 @@
    returning visitors on a frozen build. Everything else is cache-first,
    which is what makes the whole toolbox work with no network at all
    (the OCR engine + language packs enter the cache on first OCR run). */
-const V = '1';
+const V = '3';
 const CACHE = 'pdf-studio-v' + V;
 const SHELL = './index.html';
 const ASSETS = [
@@ -49,6 +49,8 @@ self.addEventListener('fetch', (e) => {
     let url;
     try { url = new URL(req.url); } catch (err) { return; }
     if (url.origin !== self.location.origin) return;
+    // blob:/data: requests (the print preview) must never be touched
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
 
     if (req.mode === 'navigate') {
         e.respondWith(

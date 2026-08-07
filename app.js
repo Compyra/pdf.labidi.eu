@@ -121,7 +121,7 @@
         setTimeout(() => URL.revokeObjectURL(url), 4000);
     }
 
-    /* ----------------------------------------------------- ZIP (stored) -- */
+    /* ------------------------------------------------------------- ZIP -- */
     const CRC_TABLE = (() => {
         const tb = new Uint32Array(256);
         for (let i = 0; i < 256; i++) {
@@ -136,42 +136,90 @@
         for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
         return (c ^ 0xFFFFFFFF) >>> 0;
     }
-    /* entries: [{name, data:Uint8Array}] → Uint8Array of a stored (method 0) zip */
-    function zipStore(entries) {
+
+    const HAS_CS = typeof CompressionStream === 'function';
+    const HAS_DS = typeof DecompressionStream === 'function';
+
+    async function streamBytes(bytes, stream) {
+        const copy = bytes.slice();          // detach from any pooled buffer
+        const piped = new Blob([copy]).stream().pipeThrough(stream);
+        return new Uint8Array(await new Response(piped).arrayBuffer());
+    }
+    async function deflateRaw(bytes) {
+        if (!HAS_CS) return null;
+        try { return await streamBytes(bytes, new CompressionStream('deflate-raw')); }
+        catch (e) { return null; }
+    }
+    async function inflateRaw(bytes) {
+        if (!HAS_DS) throw new Error('DecompressionStream unavailable');
+        return streamBytes(bytes, new DecompressionStream('deflate-raw'));
+    }
+    /* PDF FlateDecode streams carry the zlib wrapper, not raw deflate */
+    async function inflateZlib(bytes) {
+        if (!HAS_DS) throw new Error('DecompressionStream unavailable');
+        return streamBytes(bytes, new DecompressionStream('deflate'));
+    }
+
+    function dosStamp(d) {
+        return {
+            time: ((d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1)) & 0xFFFF,
+            date: (((Math.max(1980, d.getFullYear()) - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()) & 0xFFFF,
+        };
+    }
+
+    /* entries: [{name, data:Uint8Array}] → zip bytes.
+       Deflated when the browser can (all current ones), stored otherwise.
+       Repeated names are numbered — a zip with duplicates confuses extractors. */
+    async function zipMake(entries, onProgress) {
         const enc = new TextEncoder();
-        const now = new Date();
-        const dosTime = ((now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1)) & 0xFFFF;
-        const dosDate = (((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate()) & 0xFFFF;
+        const stamp = dosStamp(new Date());
         const locals = [];
         const centrals = [];
+        const used = new Set();
         let offset = 0;
+        let done = 0;
         for (const e of entries) {
-            const nameB = enc.encode(e.name);
-            const crc = crc32(e.data);
+            let name = e.name || 'file';
+            if (used.has(name)) {
+                let n = 2;
+                while (used.has(name.replace(/(\.[^./]+)?$/, '-' + n + '$1'))) n++;
+                name = name.replace(/(\.[^./]+)?$/, '-' + n + '$1');
+            }
+            used.add(name);
+            const nameB = enc.encode(name);
+            const raw = e.data;
+            const crc = crc32(raw);
+            let method = 0;
+            let body = raw;
+            if (raw.length > 64) {
+                const def = await deflateRaw(raw);
+                if (def && def.length < raw.length) { method = 8; body = def; }
+            }
             const lh = new DataView(new ArrayBuffer(30));
             lh.setUint32(0, 0x04034b50, true);
             lh.setUint16(4, 20, true);
             lh.setUint16(6, 0x0800, true);   // UTF-8 names
-            lh.setUint16(8, 0, true);        // stored
-            lh.setUint16(10, dosTime, true);
-            lh.setUint16(12, dosDate, true);
+            lh.setUint16(8, method, true);
+            lh.setUint16(10, stamp.time, true);
+            lh.setUint16(12, stamp.date, true);
             lh.setUint32(14, crc, true);
-            lh.setUint32(18, e.data.length, true);
-            lh.setUint32(22, e.data.length, true);
+            lh.setUint32(18, body.length, true);
+            lh.setUint32(22, raw.length, true);
             lh.setUint16(26, nameB.length, true);
             lh.setUint16(28, 0, true);
-            locals.push(new Uint8Array(lh.buffer), nameB, e.data);
+            locals.push(new Uint8Array(lh.buffer), nameB, body);
             const ch = new DataView(new ArrayBuffer(46));
             ch.setUint32(0, 0x02014b50, true);
             ch.setUint16(4, 20, true); ch.setUint16(6, 20, true);
-            ch.setUint16(8, 0x0800, true); ch.setUint16(10, 0, true);
-            ch.setUint16(12, dosTime, true); ch.setUint16(14, dosDate, true);
+            ch.setUint16(8, 0x0800, true); ch.setUint16(10, method, true);
+            ch.setUint16(12, stamp.time, true); ch.setUint16(14, stamp.date, true);
             ch.setUint32(16, crc, true);
-            ch.setUint32(20, e.data.length, true); ch.setUint32(24, e.data.length, true);
+            ch.setUint32(20, body.length, true); ch.setUint32(24, raw.length, true);
             ch.setUint16(28, nameB.length, true);
             ch.setUint32(42, offset, true);
             centrals.push(new Uint8Array(ch.buffer), nameB);
-            offset += 30 + nameB.length + e.data.length;
+            offset += 30 + nameB.length + body.length;
+            if (onProgress) onProgress(++done / entries.length);
         }
         let cdSize = 0;
         for (const c of centrals) cdSize += c.length;
@@ -181,14 +229,464 @@
         eocd.setUint16(10, entries.length, true);
         eocd.setUint32(12, cdSize, true);
         eocd.setUint32(16, offset, true);
-        const total = offset + cdSize + 22;
-        const out = new Uint8Array(total);
+        const out = new Uint8Array(offset + cdSize + 22);
         let p = 0;
         for (const part of locals) { out.set(part, p); p += part.length; }
         for (const part of centrals) { out.set(part, p); p += part.length; }
         out.set(new Uint8Array(eocd.buffer), p);
         return out;
     }
+
+    /* zip bytes → [{name, data}] (entries we cannot read carry .error) */
+    async function zipRead(bytes) {
+        const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        let eocd = -1;
+        const floor = Math.max(0, bytes.length - 66000);
+        for (let i = bytes.length - 22; i >= floor; i--) {
+            if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+        }
+        if (eocd < 0) throw new Error('not a ZIP archive');
+        const count = dv.getUint16(eocd + 10, true);
+        let p = dv.getUint32(eocd + 16, true);
+        if (p === 0xFFFFFFFF || count === 0xFFFF) throw new Error('ZIP64 archives are not supported');
+        const dec = new TextDecoder();
+        const out = [];
+        for (let i = 0; i < count && p + 46 <= bytes.length; i++) {
+            if (dv.getUint32(p, true) !== 0x02014b50) break;
+            let name = '(unnamed)';
+            try {
+                const flags = dv.getUint16(p + 8, true);
+                const method = dv.getUint16(p + 10, true);
+                const compSize = dv.getUint32(p + 20, true);
+                const nameLen = dv.getUint16(p + 28, true);
+                const extraLen = dv.getUint16(p + 30, true);
+                const cmtLen = dv.getUint16(p + 32, true);
+                const lho = dv.getUint32(p + 42, true);
+                name = dec.decode(bytes.subarray(p + 46, p + 46 + nameLen));
+                p += 46 + nameLen + extraLen + cmtLen;
+                if (name.endsWith('/')) continue;                       // directory entry
+                if (flags & 1) { out.push({ name, error: 'encrypted' }); continue; }
+                if (compSize === 0xFFFFFFFF) { out.push({ name, error: 'zip64' }); continue; }
+                if (lho + 30 > bytes.length) { out.push({ name, error: 'damaged' }); continue; }
+                const lnameLen = dv.getUint16(lho + 26, true);
+                const lextraLen = dv.getUint16(lho + 28, true);
+                const start = lho + 30 + lnameLen + lextraLen;
+                if (start + compSize > bytes.length) { out.push({ name, error: 'damaged' }); continue; }
+                const raw = bytes.subarray(start, start + compSize);
+                if (method === 0) out.push({ name, data: raw.slice() });
+                else if (method === 8) out.push({ name, data: await inflateRaw(raw) });
+                else out.push({ name, error: 'method' + method });
+            } catch (e) { out.push({ name, error: (e && e.message) || 'read failed' }); }
+        }
+        return out;
+    }
+
+    /* ------------------------------------------------------ WebCrypto -- */
+    const cryptoOk = () => !!(window.crypto && window.crypto.subtle);
+
+    async function deriveKey(password, salt) {
+        const km = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+        return crypto.subtle.deriveKey(
+            { name: 'PBKDF2', salt, iterations: 150000, hash: 'SHA-256' },
+            km, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    }
+    /* layout: salt(16) | iv(12) | ciphertext+tag */
+    async function aesEncrypt(bytes, password) {
+        const salt = crypto.getRandomValues(new Uint8Array(16));
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const key = await deriveKey(password, salt);
+        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes));
+        const out = new Uint8Array(28 + ct.length);
+        out.set(salt, 0); out.set(iv, 16); out.set(ct, 28);
+        return out;
+    }
+    async function aesDecrypt(bytes, password) {
+        if (bytes.length < 29) throw new Error('payload too short');
+        const key = await deriveKey(password, bytes.subarray(0, 16));
+        const plain = await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv: bytes.subarray(16, 28) }, key, bytes.subarray(28));
+        return new Uint8Array(plain);
+    }
+
+    async function sha256Hex(bytes) {
+        if (!cryptoOk()) return null;
+        const h = await crypto.subtle.digest('SHA-256', bytes.slice());
+        return [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    /* ============================================== security analysis == */
+    /* A PDF can carry scripts, auto-run actions, embedded files and links.
+       Everything below only *reads* the document; nothing is executed. */
+
+    /* action /S values that can do something to the reader.
+       Ordinary links are 'low' on purpose: almost every real document has
+       them, and a banner that cries wolf is a banner nobody reads. A link
+       that actually looks dangerous is reported separately as high. */
+    const RISK_ACTIONS = {
+        JavaScript: 'high', Launch: 'high', SubmitForm: 'high', ImportData: 'high',
+        RichMediaExecute: 'high', GoToR: 'medium', Movie: 'medium',
+        Sound: 'medium', Rendition: 'medium', URI: 'low', Hide: 'low',
+        SetOCGState: 'low', Trans: 'low', Named: 'low',
+    };
+
+    /* annotation subtypes that embed active or external content */
+    const RISK_ANNOTS = {
+        FileAttachment: 'high', RichMedia: 'high', Movie: 'medium',
+        Sound: 'medium', Screen: 'medium', '3D': 'medium',
+    };
+
+    /* pdfid-style raw keyword census — also catches things a parser may miss */
+    const RAW_KEYWORDS = ['/JavaScript', '/JS', '/OpenAction', '/AA', '/Launch',
+        '/EmbeddedFile', '/XFA', '/AcroForm', '/RichMedia', '/JBIG2Decode',
+        '/JPXDecode', '/SubmitForm', '/GoToR', '/URI', '/ObjStm', '/Encrypt'];
+
+    /* script fragments seen in weaponised PDFs; tokens stay untranslated
+       because that is how analysts search for them */
+    const JS_IOCS = [
+        { re: /\beval\s*\(/i, token: 'eval()', kind: 'suspicious' },
+        { re: /unescape\s*\(/i, token: 'unescape()', kind: 'suspicious' },
+        { re: /String\.fromCharCode/i, token: 'String.fromCharCode', kind: 'suspicious' },
+        { re: /app\.launchURL/i, token: 'app.launchURL', kind: 'suspicious' },
+        { re: /this\.exportDataObject/i, token: 'exportDataObject', kind: 'suspicious' },
+        { re: /submitForm\s*\(/i, token: 'submitForm()', kind: 'suspicious' },
+        { re: /getAnnots\s*\(/i, token: 'getAnnots()', kind: 'suspicious' },
+        { re: /app\.openDoc|this\.getURL/i, token: 'openDoc/getURL', kind: 'suspicious' },
+        { re: /(%u9090|\\u9090|\\x90\\x90)/i, token: 'NOP sled', kind: 'exploit' },
+        { re: /util\.printf/i, token: 'util.printf', kind: 'exploit', cve: 'CVE-2008-2992' },
+        { re: /media\.newPlayer/i, token: 'media.newPlayer', kind: 'exploit', cve: 'CVE-2009-4324' },
+        { re: /Collab\.collectEmailInfo/i, token: 'Collab.collectEmailInfo', kind: 'exploit', cve: 'CVE-2007-5659' },
+        { re: /Collab\.getIcon/i, token: 'Collab.getIcon', kind: 'exploit', cve: 'CVE-2009-0927' },
+        { re: /spell\.customDictionaryOpen/i, token: 'spell.customDictionaryOpen', kind: 'exploit', cve: 'CVE-2009-1493' },
+    ];
+
+    const URL_SHORTENERS = new Set(['bit.ly', 'tinyurl.com', 't.co', 'goo.gl', 'is.gd',
+        'ow.ly', 'cutt.ly', 'rb.gy', 'shorturl.at', 'buff.ly', 't.ly', 'rebrand.ly']);
+
+    /* hxxp://example[.]com — safe to paste into a ticket or a chat */
+    function defangUrl(url) {
+        return String(url)
+            .replace(/^http/i, 'hxxp')
+            .replace(/^ftp/i, 'fxp')
+            .replace(/:\/\//, '[://]')
+            .replace(/\./g, '[.]')
+            .replace(/@/g, '[@]');
+    }
+
+    /* Grades a URL. An ordinary https link is 'low': flagging every address as
+       suspicious would drown the genuinely nasty ones. Severity is only raised
+       when there is a concrete reason, and that reason is always shown. */
+    function classifyUrl(url) {
+        const why = [];
+        let sev = 'low';
+        const scheme = (String(url).split(':')[0] || '').toLowerCase();
+        if (scheme === 'javascript' || scheme === 'data') { sev = 'high'; why.push('scheme'); }
+        else if (scheme === 'file') { sev = 'high'; why.push('local'); }
+        else if (scheme !== 'http' && scheme !== 'https' && scheme !== 'mailto') { sev = 'medium'; why.push('scheme'); }
+        let u = null;
+        try { u = new URL(url); } catch (e) { /* not parseable, judge on scheme only */ }
+        if (u) {
+            const bump = (s) => { if (s === 'high' || sev === 'low') sev = s; };
+            const host = u.hostname.toLowerCase();
+            if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.startsWith('[')) { sev = 'high'; why.push('ip'); }
+            if (host.startsWith('xn--') || host.includes('.xn--')) { sev = 'high'; why.push('punycode'); }
+            if (u.username || u.password) { sev = 'high'; why.push('credentials'); }
+            if (u.port && u.port !== '80' && u.port !== '443') { bump('medium'); why.push('port'); }
+            if (URL_SHORTENERS.has(host.replace(/^www\./, ''))) { bump('medium'); why.push('shortener'); }
+            if ((u.href.match(/%[0-9a-f]{2}/gi) || []).length > 8) { bump('medium'); why.push('encoded'); }
+            if (/\.(exe|scr|js|vbs|hta|jar|ps1|bat|cmd|zip|7z|iso|lnk)$/i.test(u.pathname)) { sev = 'high'; why.push('payload'); }
+        }
+        return { sev, why };
+    }
+
+    function pdfTextValue(v) {
+        try {
+            if (!v) return '';
+            if (v instanceof PDFLib.PDFHexString) return v.decodeText();
+            if (v instanceof PDFLib.PDFString) return v.asString();
+        } catch (e) { /* unreadable string object */ }
+        return '';
+    }
+
+    /* Reads a /JS value: literal string, hex string, or a (possibly
+       compressed) stream. */
+    async function readJsValue(v) {
+        const direct = pdfTextValue(v);
+        if (direct) return direct;
+        try {
+            if (v instanceof PDFLib.PDFRawStream) {
+                const filter = v.dict.get(PDFLib.PDFName.of('Filter'));
+                let raw = v.contents;
+                if (filter === PDFLib.PDFName.of('FlateDecode')) raw = await inflateZlib(raw);
+                return new TextDecoder().decode(raw);
+            }
+        } catch (e) { /* undecodable script stream */ }
+        return '';
+    }
+
+    const SEV_ORDER = { high: 3, medium: 2, low: 1, info: 0 };
+
+    /* Read-only triage of a PDF.
+         opts.deep     also sweeps the raw bytes (keyword census, stray URLs)
+                       and hashes the file — skipped for the background scan
+                       that only feeds the warning banner.
+         opts.pageText also reads visible page text for links (uses pdf.js). */
+    async function analyzePdf(bytes, opts) {
+        const o = opts || {};
+        const N = (s) => PDFLib.PDFName.of(s);
+        const rep = {
+            size: bytes.length, sha256: null, version: null, pageCount: 0,
+            encrypted: false, findings: [], uris: [], scripts: [], embedded: [],
+            raw: {}, verdict: 'clean', highest: 'info',
+        };
+        const add = (key, sev, item) => {
+            let f = rep.findings.find((x) => x.key === key);
+            if (!f) { f = { key, sev, count: 0, items: [] }; rep.findings.push(f); }
+            f.count++;
+            if (item && f.items.length < 40 && !f.items.includes(item)) f.items.push(item);
+        };
+        const seenUrl = new Map();
+        const addUrl = (url, where) => {
+            const clean = String(url).trim().replace(/[)>\].,;'"]+$/, '');
+            if (clean.length < 5 || clean.length > 500) return;
+            const prev = seenUrl.get(clean);
+            if (prev) { if (!prev.where.includes(where)) prev.where.push(where); return; }
+            const cls = classifyUrl(clean);
+            seenUrl.set(clean, { url: clean, defanged: defangUrl(clean), where: [where], sev: cls.sev, why: cls.why });
+        };
+
+        const header = new TextDecoder('latin1').decode(bytes.subarray(0, 32));
+        const vm = header.match(/%PDF-(\d\.\d)/);
+        rep.version = vm ? vm[1] : null;
+
+        const doc = await PDFLib.PDFDocument.load(bytes, {
+            ignoreEncryption: true, throwOnInvalidObject: false, updateMetadata: false,
+        });
+        rep.encrypted = !!doc.isEncrypted;
+        try { rep.pageCount = doc.getPageCount(); } catch (e) { rep.pageCount = 0; }
+        if (rep.encrypted) add('encrypted', 'low');
+
+        /* ---- catalog-level auto-run hooks ---- */
+        const cat = doc.catalog;
+        const openAction = cat.get(N('OpenAction'));
+        if (openAction) {
+            let kind = 'GoTo';
+            try {
+                const oa = cat.lookup(N('OpenAction'));
+                if (oa instanceof PDFLib.PDFDict) {
+                    const s = oa.get(N('S'));
+                    kind = s ? String(s).replace('/', '') : 'GoTo';
+                }
+            } catch (e) { /* unreadable OpenAction */ }
+            add('openaction', RISK_ACTIONS[kind] === 'high' ? 'high' : 'medium', kind);
+        }
+        if (cat.get(N('AA'))) add('catalog_aa', 'high');
+        try {
+            const acro = cat.lookup(N('AcroForm'), PDFLib.PDFDict);
+            if (acro) {
+                add('acroform', 'low');
+                if (acro.get(N('XFA'))) add('xfa', 'high');
+            }
+        } catch (e) { /* no form */ }
+
+        /* ---- every dictionary in the file ----
+           Not just the indirect objects: most writers inline the /A action
+           dictionary inside the link annotation, so walking only the top level
+           would miss ordinary URI, Launch and JavaScript actions. */
+        let objects = 0;
+        const seen = new Set();
+        const stack = [];
+        const visit = (v) => {
+            if (!v || seen.has(v)) return;
+            if (v instanceof PDFLib.PDFDict || v instanceof PDFLib.PDFArray) { seen.add(v); stack.push(v); }
+        };
+        for (const [, obj] of doc.context.enumerateIndirectObjects()) {
+            objects++;
+            if (obj instanceof PDFLib.PDFDict) visit(obj);
+            else if (obj instanceof PDFLib.PDFRawStream) visit(obj.dict);
+        }
+        visit(cat);
+        rep.objects = objects;
+
+        while (stack.length) {
+            const node = stack.pop();
+            if (node instanceof PDFLib.PDFArray) {
+                for (let i = 0; i < node.size(); i++) visit(node.get(i));
+                continue;
+            }
+            const dict = node;
+
+            const sVal = dict.get(N('S'));
+            if (sVal) {
+                const kind = String(sVal).replace('/', '');
+                const sev = RISK_ACTIONS[kind];
+                if (sev) {
+                    if (kind === 'URI') {
+                        const uri = pdfTextValue(dict.lookup(N('URI')));
+                        if (uri) addUrl(uri, 'link');
+                        add('act_URI', 'low', uri || null);
+                    } else if (kind === 'JavaScript') {
+                        const code = await readJsValue(dict.lookup(N('JS')));
+                        if (code) rep.scripts.push({ name: 'action', code });
+                        add('act_JavaScript', 'high');
+                    } else if (kind === 'Launch') {
+                        let target = '';
+                        try {
+                            const f = dict.lookup(N('F'));
+                            target = pdfTextValue(f) || pdfTextValue(f && f.lookup && f.lookup(N('F'))) || '';
+                        } catch (e) { /* opaque target */ }
+                        add('act_Launch', 'high', target || null);
+                    } else {
+                        add('act_' + kind, sev);
+                    }
+                }
+            }
+
+            const sub = dict.get(N('Subtype'));
+            if (sub) {
+                const name = String(sub).replace('/', '');
+                if (RISK_ANNOTS[name]) add('annot_' + name, RISK_ANNOTS[name]);
+            }
+
+            const type = dict.get(N('Type'));
+            if (type && String(type) === '/Filespec') {
+                // a specification without /EF carries no payload — the action
+                // that points at it is reported separately
+                let bytesLen = null;
+                let hasData = false;
+                try {
+                    const ef = dict.lookup(N('EF'), PDFLib.PDFDict);
+                    const st = ef && ef.lookup(N('F'));
+                    if (ef) hasData = true;
+                    /* /Params /Size is the real file size; st.contents is the
+                       compressed stream, which would be a misleading figure. */
+                    if (st && st.dict) {
+                        const prm = st.dict.lookup(N('Params'), PDFLib.PDFDict);
+                        const sz = prm && prm.lookup(N('Size'));
+                        if (sz && typeof sz.asNumber === 'function') bytesLen = sz.asNumber();
+                    }
+                    if (bytesLen === null && st && st.contents) bytesLen = st.contents.length;
+                } catch (e) { /* size unknown */ }
+                if (hasData) {
+                    const fname = pdfTextValue(dict.lookup(N('UF'))) || pdfTextValue(dict.lookup(N('F'))) || '(unnamed)';
+                    const risky = /\.(exe|scr|js|jse|vbs|vbe|wsf|hta|jar|ps1|bat|cmd|com|pif|lnk|dll|iso|img|docm|xlsm|pptm|zip|7z|rar)$/i.test(fname);
+                    rep.embedded.push({ name: fname, size: bytesLen, risky });
+                    add('embedded_file', risky ? 'high' : 'medium', fname);
+                }
+            }
+
+            if (dict.get(N('AA'))) add('object_aa', 'medium');
+            if (dict.get(N('JS')) && !sVal) {
+                const code = await readJsValue(dict.lookup(N('JS')));
+                if (code) rep.scripts.push({ name: 'entry', code });
+                add('js_entry', 'high');
+            }
+
+            const filt = dict.get(N('Filter'));
+            if (filt) {
+                const fs = String(filt);
+                // common in scanned documents; only interesting next to other signals
+                if (fs.includes('JBIG2Decode')) add('filter_jbig2', 'low');
+                if (fs.includes('JPXDecode')) add('filter_jpx', 'low');
+            }
+
+            for (const v of dict.values()) visit(v);
+        }
+
+        /* ---- document-level script name tree ---- */
+        try {
+            const scripts = doc.getDocumentJavaScripts ? doc.getDocumentJavaScripts() : [];
+            for (const s of scripts) {
+                if (s && s.script) {
+                    rep.scripts.push({ name: s.name || 'document', code: s.script });
+                    add('doc_javascript', 'high', s.name || null);
+                }
+            }
+        } catch (e) { /* no scripts */ }
+
+        /* ---- raw keyword census + obfuscation check ---- */
+        if (o.deep) {
+            const rawText = new TextDecoder('latin1').decode(bytes);
+            for (const kw of RAW_KEYWORDS) {
+                let n = 0;
+                for (let i = rawText.indexOf(kw); i !== -1; i = rawText.indexOf(kw, i + kw.length)) n++;
+                if (n) rep.raw[kw] = n;
+            }
+
+            /* Hex-escaped names only matter when they decode to a keyword worth
+               hiding — random "#4a" byte pairs inside streams are meaningless. */
+            const EVADED = /^(JavaScript|JS|OpenAction|AA|Launch|EmbeddedFile|EmbeddedFiles|XFA|URI|SubmitForm|ImportData|RichMedia|Filespec|Names|Action)$/i;
+            const hexNames = rawText.match(/\/[A-Za-z0-9#]{0,40}#[0-9A-Fa-f]{2}[A-Za-z0-9#]{0,40}/g) || [];
+            const evaded = [];
+            for (const rawName of hexNames) {
+                const decoded = rawName.slice(1).replace(/#([0-9A-Fa-f]{2})/g, (mm, h) => String.fromCharCode(parseInt(h, 16)));
+                if (EVADED.test(decoded) && !evaded.some((x) => x.startsWith(rawName))) evaded.push(rawName + ' \u2192 /' + decoded);
+            }
+            for (const e of evaded.slice(0, 10)) add('obfuscated_names', 'high', e);
+
+            /* ---- URLs in the raw bytes (metadata, uncompressed streams) ---- */
+            const urlRe = /\b(?:https?|ftp|file|mailto|javascript):(?:\/\/)?[^\s<>()"'\\{}\[\]]{4,300}/gi;
+            let m;
+            let rawUrls = 0;
+            while ((m = urlRe.exec(rawText)) && rawUrls < 400) {
+                if (!/[\x20-\x7E]{6,}/.test(m[0])) continue;
+                addUrl(m[0], 'file');
+                rawUrls++;
+            }
+        }
+
+        /* ---- optional: links that are only visible as page text ---- */
+        if (o.pageText) {
+            /* Best effort, and time-boxed: everything above already produced a
+               usable report, so a renderer that stalls on a malformed file must
+               not leave the user staring at a progress bar forever. */
+            let pdoc = null;
+            try {
+                const budget = new Promise((resolve) => setTimeout(() => resolve('timeout'), 30000));
+                const sweep = (async () => {
+                    pdoc = await pdfjsDocFor(bytes);
+                    const max = Math.min(pdoc.numPages, 60);
+                    for (let i = 0; i < max; i++) {
+                        const page = await pdoc.getPage(i + 1);
+                        const tc = await page.getTextContent();
+                        const txt = tc.items.map((it) => it.str).join(' ');
+                        let mm;
+                        const re2 = /\b(?:https?:\/\/|www\.)[^\s<>()"']{4,300}/gi;
+                        while ((mm = re2.exec(txt))) addUrl(mm[0].startsWith('www.') ? 'http://' + mm[0] : mm[0], 'text');
+                        if (o.onProgress) o.onProgress((i + 1) / max);
+                    }
+                    return 'done';
+                })();
+                rep.textScan = await Promise.race([sweep, budget]);
+            } catch (e) {
+                rep.textScan = 'failed';
+            }
+            try { if (pdoc) pdoc.destroy(); } catch (e) { /* already gone */ }
+        }
+
+        rep.uris = [...seenUrl.values()].sort((a, b) => SEV_ORDER[b.sev] - SEV_ORDER[a.sev]);
+        for (const u of rep.uris) if (u.sev === 'high') add('suspicious_url', 'high', u.defanged);
+        if (rep.uris.length) add('external_links', 'low');
+
+        /* ---- script indicators ---- */
+        const allCode = rep.scripts.map((s) => s.code).join('\n');
+        rep.jsIocs = [];
+        if (allCode) {
+            for (const ioc of JS_IOCS) {
+                if (ioc.re.test(allCode)) {
+                    rep.jsIocs.push({ token: ioc.token, kind: ioc.kind, cve: ioc.cve || null });
+                    if (ioc.kind === 'exploit') add('js_exploit', 'high', ioc.token + (ioc.cve ? ' (' + ioc.cve + ')' : ''));
+                }
+            }
+            if (allCode.length > 20000) add('js_large', 'medium', fmtSize(allCode.length));
+        }
+
+        rep.sha256 = o.deep ? await sha256Hex(bytes) : null;
+        rep.findings.sort((a, b) => SEV_ORDER[b.sev] - SEV_ORDER[a.sev]);
+        for (const f of rep.findings) if (SEV_ORDER[f.sev] > SEV_ORDER[rep.highest]) rep.highest = f.sev;
+        rep.verdict = rep.highest === 'high' ? 'danger' : rep.highest === 'medium' ? 'caution' : 'clean';
+        return rep;
+    }
+
 
     /* -------------------------------------------------- image utilities -- */
     async function decodeImage(bytes, mime) {
@@ -334,14 +832,23 @@
 
     async function countPages(bytes) {
         try {
-            const doc = await pdfjsDocFor(bytes);
+            /* Time-boxed: a malformed file can leave pdf.js waiting forever, and
+               that would stall the whole workspace load — including the warning
+               banner, which is exactly what a hostile file must not be able to
+               suppress. pdf-lib parses in this thread and always answers. */
+            const doc = await Promise.race([
+                pdfjsDocFor(bytes),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('pdfjs timeout')), 15000)),
+            ]);
             const n = doc.numPages;
             doc.destroy();
             return n;
         } catch (e) {
             // pdf.js choked but pdf-lib produced these bytes — count there instead
-            const d = await PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true, throwOnInvalidObject: false, updateMetadata: false });
-            return d.getPageCount();
+            try {
+                const d = await PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true, throwOnInvalidObject: false, updateMetadata: false });
+                return d.getPageCount();
+            } catch (e2) { return 0; }
         }
     }
 
@@ -352,14 +859,17 @@
             trimHistory();
             state.future = [];
         }
-        if (o.fresh) { state.history = []; state.future = []; }
+        if (o.fresh) { state.history = []; state.future = []; riskDismissed = false; }
         state.bytes = bytes;
         if (o.name) state.name = o.name;
         invalidateDocCache();
-        state.pageCount = o.pageCount !== undefined ? o.pageCount : await countPages(bytes);
+        try {
+            state.pageCount = o.pageCount !== undefined ? o.pageCount : await countPages(bytes);
+        } catch (e) { state.pageCount = 0; }
         updateChip();
-        document.dispatchEvent(new CustomEvent('pdfstudio:workspace'));
+        document.dispatchEvent(new CustomEvent('pdfstudio:workspace', { detail: { fresh: !!o.fresh } }));
         if (previewOpen) renderPreview();
+        refreshRisk();
     }
 
     function undo() {
@@ -370,6 +880,7 @@
         invalidateDocCache(); updateChip(); toast(t('toast_undo'));
         document.dispatchEvent(new CustomEvent('pdfstudio:workspace'));
         if (previewOpen) renderPreview();
+        refreshRisk();
     }
     function redo() {
         if (!state.future.length) return;
@@ -379,6 +890,7 @@
         invalidateDocCache(); updateChip(); toast(t('toast_redo'));
         document.dispatchEvent(new CustomEvent('pdfstudio:workspace'));
         if (previewOpen) renderPreview();
+        refreshRisk();
     }
 
     function closeWorkspace() {
@@ -387,6 +899,7 @@
         state.bytes = null; state.history = []; state.future = []; state.pageCount = 0;
         invalidateDocCache(); updateChip(); closePreview();
         document.dispatchEvent(new CustomEvent('pdfstudio:workspace'));
+        renderRiskBanner(null);
         route();
     }
 
@@ -398,6 +911,58 @@
         $('#ws-meta').textContent = t('ws_pages', { n: state.pageCount }) + ' · ' + fmtSize(state.bytes.length);
         $('#ws-undo').disabled = !state.history.length;
         $('#ws-redo').disabled = !state.future.length;
+    }
+
+    /* ------------------------------------------------------ risk banner -- */
+    let riskDismissed = false;
+    let riskToken = 0;
+    let lastRisk = null;
+
+    function renderRiskBanner(rep) {
+        const banner = $('#risk-banner');
+        banner.textContent = '';
+        if (!rep || riskDismissed || (rep.verdict !== 'danger' && rep.verdict !== 'caution')) {
+            banner.hidden = true;
+            return;
+        }
+        const high = rep.verdict === 'danger';
+        banner.className = 'risk-banner' + (high ? '' : ' is-medium');
+        banner.hidden = false;
+        const parts = [];
+        const scripts = rep.findings.filter((f) => f.key === 'doc_javascript' || f.key === 'act_JavaScript' || f.key === 'js_entry')
+            .reduce((s, f) => s + f.count, 0);
+        if (scripts) parts.push(t('rb_p_js', { n: scripts }));
+        if (rep.uris.length) parts.push(t('rb_p_links', { n: rep.uris.length }));
+        if (rep.embedded.length) parts.push(t('rb_p_files', { n: rep.embedded.length }));
+        if (rep.findings.some((f) => f.key === 'openaction' || f.key === 'catalog_aa')) parts.push(t('rb_p_auto'));
+        if (rep.findings.some((f) => f.key === 'act_Launch')) parts.push(t('rb_p_launch'));
+
+        banner.appendChild(el('span', { class: 'rb-ico', 'aria-hidden': 'true' }, high ? '⚠️' : 'ℹ️'));
+        banner.appendChild(el('div', { class: 'rb-text' },
+            el('strong', { text: high ? t('rb_title_high') : t('rb_title_med') }),
+            el('span', { text: (parts.join(' · ') || t('rb_p_other')) + ' — ' + t('rb_advice') })));
+        const dismiss = el('button', { type: 'button', class: 'icon-btn', 'aria-label': t('close'), title: t('close') }, '✕');
+        dismiss.addEventListener('click', () => { riskDismissed = true; banner.hidden = true; });
+        banner.appendChild(el('div', { class: 'rb-actions' },
+            el('a', { class: 'btn', href: '#/tool/threat-scan' }, '🔬 ' + t('rb_inspect')),
+            el('a', { class: 'btn', href: '#/tool/defang' }, '🛡️ ' + t('rb_defang')),
+            dismiss));
+    }
+
+    /* Re-runs after every change so the warning always matches the document
+       currently in the workspace (defanging clears it). */
+    async function refreshRisk() {
+        const my = ++riskToken;
+        if (!state.bytes) { lastRisk = null; renderRiskBanner(null); return; }
+        if (state.bytes.length > 150 * 1024 * 1024) { renderRiskBanner(null); return; }
+        try {
+            const rep = await analyzePdf(state.bytes);
+            if (my !== riskToken) return;
+            lastRisk = rep;
+            renderRiskBanner(rep);
+        } catch (e) {
+            if (my === riskToken) { lastRisk = null; renderRiskBanner(null); }
+        }
     }
 
     /* password prompt (modal) — resolves string or null on cancel */
@@ -659,11 +1224,18 @@
                 }
                 card.appendChild(itemsBox);
                 if (files.length > 1) {
-                    card.appendChild(el('div', { class: 'btn-row', style: 'margin-top:.7rem' },
-                        el('button', {
-                            type: 'button', class: 'btn btn-primary',
-                            onclick: () => download(zipStore(files.map((f) => ({ name: f.name, data: f.bytes }))), baseName(state.name || 'files') + '.zip', 'application/zip'),
-                        }, t('btn_download_all'))));
+                    const zipBtn = el('button', { type: 'button', class: 'btn btn-primary' }, t('btn_download_all'));
+                    zipBtn.addEventListener('click', async () => {
+                        zipBtn.disabled = true;
+                        const label = zipBtn.textContent;
+                        zipBtn.textContent = t('working');
+                        try {
+                            const zip = await zipMake(files.map((f) => ({ name: f.name, data: f.bytes })));
+                            download(zip, baseName(state.name || 'files') + '.zip', 'application/zip');
+                        } catch (err) { toast(t('err_generic', { msg: (err && err.message) || String(err) }), 'err'); }
+                        finally { zipBtn.disabled = false; zipBtn.textContent = label; }
+                    });
+                    card.appendChild(el('div', { class: 'btn-row', style: 'margin-top:.7rem' }, zipBtn));
                 }
                 resultHost.appendChild(card);
                 return card;
@@ -699,6 +1271,11 @@
             },
             host: resultHost,
         };
+        // a different document makes any result on screen meaningless
+        document.addEventListener('pdfstudio:workspace', function h(e) {
+            if (!document.body.contains(resultHost)) { document.removeEventListener('pdfstudio:workspace', h); return; }
+            if (e.detail && e.detail.fresh) api.clear();
+        });
         return api;
     }
 
@@ -961,6 +1538,7 @@
                 $('#lang-current').textContent = b.dataset.lang.toUpperCase();
                 $('#lang-menu').querySelectorAll('button[data-lang]').forEach((x) => x.setAttribute('aria-current', String(x === b)));
                 buildNav(); route(); updateChip();
+                renderRiskBanner(lastRisk);
             });
         });
 
@@ -1048,7 +1626,10 @@
         makeRunner, runButton, workspaceGate, baseName,
         state, setWorkspace, loadWorkspaceFile, undo, redo,
         getDoc, pdfjsDocFor, renderPage, replacePagesWithImages,
-        parseRanges, download, zipStore, crc32, fmtSize, toast,
+        parseRanges, download, zipMake, zipRead, crc32, fmtSize, toast,
+        deflateRaw, inflateRaw, inflateZlib, aesEncrypt, aesDecrypt, cryptoOk,
+        analyzePdf, defangUrl, classifyUrl, sha256Hex, refreshRisk,
+        get lastRisk() { return lastRisk; },
         decodeImage, canvasToBytes, toPngBytes, winAnsiSafe, hexToRgb,
         askPassword,
         tools,

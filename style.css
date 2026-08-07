@@ -120,13 +120,15 @@ select:focus-visible, textarea:focus-visible, [tabindex]:focus-visible {
 /* workspace chip (current file) */
 .ws-chip {
     display: flex; align-items: center; gap: .3rem; min-width: 0;
+    flex: 0 1 auto;
     border: 1px solid var(--line); border-radius: 12px;
     background: var(--panel); padding: .2rem .3rem .2rem .6rem;
 }
-.ws-name { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; padding: 0 .3rem; }
-.ws-file { max-width: clamp(90px, 22vw, 300px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: .82rem; }
+/* the buttons keep their size; the filename gives up whatever is left */
+.ws-name { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; flex: 1 1 auto; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; padding: 0 .3rem; }
+.ws-file { max-width: min(300px, 22vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: .82rem; }
 .ws-meta { color: var(--muted); font-size: .68rem; }
-.ws-actions { display: flex; gap: .2rem; }
+.ws-actions { display: flex; gap: .2rem; flex: none; }
 .ws-actions .icon-btn { min-width: 1.9rem; min-height: 1.9rem; border: 0; background: none; }
 .ws-actions .icon-btn:hover { background: var(--panel-2); }
 
@@ -333,9 +335,12 @@ pre.info-block {
     font-family: var(--mono); font-size: .78rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
 }
 
-table.kv { width: 100%; border-collapse: collapse; font-size: .84rem; }
+table.kv { width: 100%; border-collapse: collapse; font-size: .84rem; table-layout: fixed; }
 table.kv td { padding: .35rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
-table.kv td:first-child { color: var(--muted); white-space: nowrap; width: 1%; padding-right: 1rem; }
+table.kv td:first-child { color: var(--muted); white-space: nowrap; width: 8.5rem; padding-right: 1rem; }
+/* a SHA-256 is 64 unbroken characters and would otherwise push the whole
+   page sideways on a phone */
+table.kv td:last-child { overflow-wrap: anywhere; word-break: break-word; }
 
 /* page grid (organize / select pages) */
 .page-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: .6rem; }
@@ -380,6 +385,69 @@ table.kv td:first-child { color: var(--muted); white-space: nowrap; width: 1%; p
 .cmp-cols canvas { width: 100%; height: auto; border-radius: 8px; background: #fff; }
 .diff-del { background: color-mix(in srgb, var(--err) 30%, transparent); text-decoration: line-through; }
 .diff-add { background: color-mix(in srgb, var(--ok) 30%, transparent); }
+
+/* ------------------------------------------------------ risk banner -- */
+.risk-banner {
+    display: flex; align-items: flex-start; gap: .8rem; flex-wrap: wrap;
+    margin: 0 0 1.1rem; padding: .85rem 1rem;
+    border: 1px solid color-mix(in srgb, var(--err) 55%, var(--line));
+    border-left: 5px solid var(--err);
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--err) 12%, var(--panel));
+}
+.risk-banner.is-medium {
+    border-color: color-mix(in srgb, var(--accent-2) 55%, var(--line));
+    border-left-color: var(--accent-2);
+    background: color-mix(in srgb, var(--accent-2) 12%, var(--panel));
+}
+.risk-banner .rb-ico { font-size: 1.3rem; line-height: 1.2; flex: none; }
+.risk-banner .rb-text { flex: 1 1 16rem; min-width: 0; display: flex; flex-direction: column; gap: .2rem; }
+.risk-banner .rb-text strong { font-size: .92rem; }
+.risk-banner .rb-text span { color: var(--muted); font-size: .82rem; line-height: 1.45; }
+.risk-banner .rb-actions { display: flex; gap: .4rem; flex-wrap: wrap; align-items: center; }
+.risk-banner .btn { padding: .45rem .9rem; font-size: .84rem; }
+
+/* severity chips + report blocks */
+.sev {
+    display: inline-block; padding: .08rem .5rem; border-radius: 999px;
+    font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+    border: 1px solid currentColor; flex: none;
+}
+.sev-high { color: var(--err); }
+.sev-medium { color: var(--accent-2); }
+.sev-low, .sev-info { color: var(--muted); }
+
+.verdict {
+    display: flex; align-items: center; gap: .7rem; flex-wrap: wrap;
+    padding: .8rem 1rem; border-radius: 12px; margin-bottom: 1rem;
+    border: 1px solid var(--line); background: var(--panel);
+}
+.verdict.v-danger { border-color: color-mix(in srgb, var(--err) 60%, var(--line)); background: color-mix(in srgb, var(--err) 12%, var(--panel)); }
+.verdict.v-caution { border-color: color-mix(in srgb, var(--accent-2) 60%, var(--line)); background: color-mix(in srgb, var(--accent-2) 12%, var(--panel)); }
+.verdict.v-clean { border-color: color-mix(in srgb, var(--ok) 55%, var(--line)); background: color-mix(in srgb, var(--ok) 10%, var(--panel)); }
+.verdict .v-ico { font-size: 1.6rem; }
+.verdict strong { font-size: 1rem; }
+.verdict small { color: var(--muted); display: block; margin-top: .15rem; }
+
+.finding-list { display: flex; flex-direction: column; gap: .5rem; }
+.finding {
+    display: flex; align-items: flex-start; gap: .6rem; flex-wrap: wrap;
+    padding: .55rem .7rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-2);
+}
+.finding .f-main { flex: 1 1 14rem; min-width: 0; }
+.finding .f-main strong { display: block; font-size: .86rem; }
+.finding .f-main small { color: var(--muted); font-size: .76rem; line-height: 1.45; }
+.finding .f-items {
+    width: 100%; margin: .35rem 0 0; padding: .35rem .5rem; border-radius: 8px;
+    background: var(--panel); font-family: var(--mono); font-size: .74rem;
+    color: var(--muted); word-break: break-all; max-height: 9rem; overflow: auto;
+}
+.ioc-token { font-family: var(--mono); font-size: .78rem; word-break: break-all; }
+
+.url-row { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; padding: .4rem .6rem; border-bottom: 1px solid var(--line); }
+.url-row:last-child { border-bottom: 0; }
+.url-row code { font-family: var(--mono); font-size: .76rem; word-break: break-all; flex: 1 1 12rem; }
+.url-why { color: var(--muted); font-size: .7rem; }
 
 /* toasts */
 .toasts { position: fixed; bottom: calc(1rem + env(safe-area-inset-bottom, 0px)); left: 50%; transform: translateX(-50%); z-index: 90; display: flex; flex-direction: column; gap: .5rem; width: min(92vw, 26rem); }
@@ -439,6 +507,18 @@ table.kv td:first-child { color: var(--muted); white-space: nowrap; width: 1%; p
     .ws-file { max-width: 30vw; }
     .tool-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
     .dropzone-inner { padding: 2rem; }
+}
+
+/* With a file open there is no room for the brand, the filename, undo/redo
+   and the three top actions on one line. Give the file chip its own row so
+   every control stays reachable instead of being pushed off-screen. */
+@media (max-width: 430px) {
+    .brand-mark { display: none; }
+    .topbar { flex-wrap: wrap; gap: .35rem; }
+    .top-actions { gap: .2rem; }
+    .ws-chip { order: 1; flex-basis: 100%; width: 100%; }
+    .ws-name { flex: 1 1 auto; }
+    .ws-file { max-width: 100%; }
 }
 
 @media (prefers-reduced-motion: reduce) {
